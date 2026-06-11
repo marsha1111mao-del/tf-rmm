@@ -1,4 +1,14 @@
 build
+build*/
+out/
+*.o
+*.a
+*.elf
+*.map
+*.log
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
 *.cscope
 cscope.*
 .tags
@@ -9,5 +19,8 @@ tags
 out
 *~
 *.patch
+!patches/
+!patches/submodules/
+!patches/submodules/*.patch
 *.swp
 ext/libspdm

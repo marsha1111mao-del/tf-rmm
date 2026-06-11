@@ -1,0 +1,32 @@
+diff --git a/library/CMakeLists.txt b/library/CMakeLists.txt
+index e6705de558..aa49bfcc51 100644
+--- a/library/CMakeLists.txt
++++ b/library/CMakeLists.txt
+@@ -201,7 +201,7 @@ if(CMAKE_COMPILER_IS_GNUCC)
+ endif(CMAKE_COMPILER_IS_GNUCC)
+ 
+ if(CMAKE_COMPILER_IS_CLANG)
+-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wmissing-declarations -Wmissing-prototypes -Wdocumentation -Wno-documentation-deprecated-sync -Wunreachable-code")
++    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wmissing-declarations -Wmissing-prototypes -Wno-documentation-deprecated-sync")
+ endif(CMAKE_COMPILER_IS_CLANG)
+ 
+ if(CMAKE_COMPILER_IS_MSVC)
+diff --git a/library/platform_util.c b/library/platform_util.c
+index 0741bf575e..a15cda463d 100644
+--- a/library/platform_util.c
++++ b/library/platform_util.c
+@@ -37,12 +37,14 @@
+ #include <windows.h>
+ #endif
+ 
++#if 0
+ // Detect platforms known to support explicit_bzero()
+ #if defined(__GLIBC__) && (__GLIBC__ >= 2) && (__GLIBC_MINOR__ >= 25)
+ #define MBEDTLS_PLATFORM_HAS_EXPLICIT_BZERO 1
+ #elif (defined(__FreeBSD__) && (__FreeBSD_version >= 1100037)) || defined(__OpenBSD__)
+ #define MBEDTLS_PLATFORM_HAS_EXPLICIT_BZERO 1
+ #endif
++#endif
+ 
+ #if !defined(MBEDTLS_PLATFORM_ZEROIZE_ALT)
+ 
