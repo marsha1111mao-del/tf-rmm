@@ -11,6 +11,7 @@
 #include <granule.h>
 #include <measurement.h>
 #include <realm.h>
+#include <rsi-handler.h>
 #include <s2tt.h>
 #include <simd.h>
 #include <smc-handler.h>
@@ -538,6 +539,7 @@ unsigned long smc_realm_destroy(unsigned long rd_addr)
 	 */
 	vmid_free(rd->s2_ctx.vmid);
 	buffer_unmap(rd);
+	opencca_gpu_release_realm_mappings(g_rd);
 
 	free_sl_rtts(g_rtt, num_rtts);
 

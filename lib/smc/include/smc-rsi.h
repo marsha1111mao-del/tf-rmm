@@ -229,4 +229,26 @@ struct rsi_host_call {
  */
 #define SMC_RSI_HOST_CALL		SMC64_RSI_FID(U(0x9))
 
+/*
+ * OpenCCA experimental trusted-device helper.
+ *
+ * arg1 == IPA of one Realm granule containing an array of 64-bit GPAs.
+ * arg2 == Number of entries in the array.
+ * ret0 == Status / error
+ *
+ * On success, each input GPA entry is replaced with the RMM-validated PA/HPA
+ * backing the current Realm's assigned RAM mapping.
+ */
+#define SMC_RSI_OPENCCA_GPA_TO_HPA	SMC64_RSI_FID(U(0x1f))
+
+/*
+ * OpenCCA experimental GPU mapping-lease release helper.
+ *
+ * arg1 == IPA of one Realm granule containing an array of 64-bit HPA values
+ *         previously returned by SMC_RSI_OPENCCA_GPA_TO_HPA.
+ * arg2 == Number of entries in the array.
+ * ret0 == Status / error.
+ */
+#define SMC_RSI_OPENCCA_GPU_REVOKE	SMC64_RSI_FID(U(0x1e))
+
 #endif /* SMC_RSI_H */
