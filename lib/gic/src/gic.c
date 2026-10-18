@@ -135,9 +135,11 @@ void gic_copy_state_from_rec_entry(struct gic_cpu_state *gicstate,
 	unsigned int i;
 
 	/* Copy List Registers */
-	for (i = 0U; i <= gic_virt_feature.nr_lrs; i++) {
+	for (i = 0U; i < gic_virt_feature.nr_lrs; i++) {
 		gicstate->ich_lr_el2[i] = rec_enter->gicv3_lrs[i];
 	}
+
+	/* Final LR retains its RMM-owned state across Host exits. */
 
 	/* Get bits from NS hypervisor */
 	gicstate->ich_hcr_el2 &= ~ICH_HCR_EL2_NS_MASK;
@@ -150,9 +152,12 @@ void gic_copy_state_to_rec_exit(struct gic_cpu_state *gicstate,
 	unsigned int i;
 
 	/* Copy List Registers */
-	for (i = 0U; i <= gic_virt_feature.nr_lrs; i++) {
+	for (i = 0U; i < gic_virt_feature.nr_lrs; i++) {
 		rec_exit->gicv3_lrs[i] = gicstate->ich_lr_el2[i];
 	}
+
+	/* Never disclose or accept the trusted event LR through Host. */
+	rec_exit->gicv3_lrs[gic_virt_feature.nr_lrs] = 0UL;
 
 	rec_exit->gicv3_misr = gicstate->ich_misr_el2;
 	rec_exit->gicv3_vmcr = gicstate->ich_vmcr_el2;

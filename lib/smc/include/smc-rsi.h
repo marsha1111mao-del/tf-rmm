@@ -251,4 +251,11 @@ struct rsi_host_call {
  */
 #define SMC_RSI_OPENCCA_GPU_REVOKE	SMC64_RSI_FID(U(0x1e))
 
+/* Experimental inter-Realm endpoint and persistent event-state interface.
+ * x1: operation, x2: endpoint/channel ID, x3: observed sequence; x4..x7: 0.
+ * x0: RSI status, x1..x4: operation-specific output (xshm_endpoint.h).
+ * This interface advertises no shared-memory or interrupt-injection support.
+ */
+#define SMC_RSI_OPENCCA_XSHM		SMC64_RSI_FID(U(0x1d))
+
 #endif /* SMC_RSI_H */

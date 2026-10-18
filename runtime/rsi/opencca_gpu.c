@@ -2,337 +2,182 @@
  * SPDX-License-Identifier: BSD-3-Clause
  * SPDX-FileCopyrightText: Copyright TF-RMM Contributors.
  */
-
-#include <buffer.h>
 #include <arch_helpers.h>
+#include <buffer.h>
+#include <cpuid.h>
 #include <debug.h>
 #include <granule.h>
-#include <limits.h>
+#include <opencca_gpu_lease.h>
 #include <realm.h>
 #include <rsi-handler.h>
 #include <smc-rsi.h>
 #include <spinlock.h>
+#include <string.h>
 
-#define OPENCCA_GPA_TO_HPA_MAX_ENTRIES	(GRANULE_SIZE / sizeof(unsigned long))
-#define OPENCCA_GPU_MAPPING_MAX		8192U
-
-struct opencca_gpu_mapping {
-	struct granule *rd;
-	unsigned long hpa;
-	unsigned short refcount;
-	bool active;
-};
+#define OPENCCA_GPA_TO_HPA_MAX_ENTRIES (GRANULE_SIZE / sizeof(unsigned long))
+_Static_assert(OPENCCA_GPA_TO_HPA_MAX_ENTRIES == OPENCCA_GPU_LEASE_BATCH,
+	       "GPU batch must fit in one granule");
 
 static spinlock_t opencca_gpu_mappings_lock;
-static struct opencca_gpu_mapping
-	opencca_gpu_mappings[OPENCCA_GPU_MAPPING_MAX];
-static unsigned int opencca_gpu_mappings_active;
-static unsigned int opencca_gpu_map_log_budget = 32U;
-static unsigned int opencca_gpu_unmap_log_budget = 32U;
-
-static void opencca_gpu_clear_mapping_locked(unsigned int index)
-{
-	opencca_gpu_mappings[index].active = false;
-	opencca_gpu_mappings[index].rd = NULL;
-	opencca_gpu_mappings[index].hpa = 0UL;
-	opencca_gpu_mappings[index].refcount = 0U;
-	opencca_gpu_mappings_active--;
-}
+/* A synchronous RSI cannot re-enter on the same CPU. Keep the bounded batch
+ * private without consuming a granule-sized chunk of the RMM stack.
+ */
+static unsigned long gpu_batch[MAX_CPUS][OPENCCA_GPU_LEASE_BATCH];
 
 static enum s2_walk_status opencca_gpu_ipa_to_pa(struct rec *rec,
-						 unsigned long ipa,
-						 unsigned long *pa,
-						 unsigned long *rtt_level,
-						 enum ripas *ripas)
+		unsigned long ipa, unsigned long *pa, unsigned long *rtt_level,
+		enum ripas *ripas)
 {
-	struct s2_walk_result walk_res;
-	enum s2_walk_status walk_status;
+	struct s2_walk_result walk;
+	enum s2_walk_status status = realm_ipa_to_pa(rec, ipa, &walk);
 
-	walk_status = realm_ipa_to_pa(rec, ipa, &walk_res);
-	if (walk_status == WALK_SUCCESS) {
-		*pa = walk_res.pa;
-		granule_unlock(walk_res.llt);
-		return WALK_SUCCESS;
+	if (status == WALK_SUCCESS) {
+		*pa = walk.pa;
+		granule_unlock(walk.llt);
+	} else if (status == WALK_FAIL) {
+		*rtt_level = walk.rtt_level;
+		*ripas = walk.ripas_val;
 	}
-
-	if (walk_status == WALK_FAIL) {
-		*rtt_level = walk_res.rtt_level;
-		*ripas = walk_res.ripas_val;
-	}
-
-	return walk_status;
+	return status;
 }
 
-static bool opencca_gpu_read_entry(struct rec *rec, unsigned long array_ipa,
-				   unsigned long index, unsigned long *ipa,
-				   struct rsi_result *res)
+/* Snapshot inputs, or commit all outputs, under one array-page RTT lock.
+ * No outputs are published before all translations/leases have succeeded.
+ */
+static bool access_array(struct rec *rec, unsigned long array_ipa,
+		unsigned long *batch, unsigned long count, bool write,
+		struct rsi_result *res)
 {
-	enum s2_walk_status walk_status;
-	struct s2_walk_result array_walk;
+	struct s2_walk_result walk;
+	enum s2_walk_status status = realm_ipa_to_pa(rec, array_ipa, &walk);
 	struct granule *gr;
 	unsigned long *array;
+	size_t bytes = count * sizeof(*array);
 
-	walk_status = realm_ipa_to_pa(rec, array_ipa, &array_walk);
-	switch (walk_status) {
-	case WALK_SUCCESS:
-		break;
-	case WALK_FAIL:
-		if (array_walk.ripas_val == RIPAS_EMPTY) {
+	if (status == WALK_FAIL) {
+		if (walk.ripas_val == RIPAS_EMPTY)
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
-		} else {
+		else {
 			res->action = STAGE_2_TRANSLATION_FAULT;
-			res->rtt_level = array_walk.rtt_level;
+			res->rtt_level = walk.rtt_level;
 		}
 		return false;
-	case WALK_INVALID_PARAMS:
-	default:
+	}
+	if (status != WALK_SUCCESS) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;
 		return false;
 	}
-
-	gr = find_granule(array_walk.pa);
+	gr = find_granule(walk.pa);
 	assert(gr != NULL);
-	array = (unsigned long *)buffer_granule_map(gr, SLOT_RSI_CALL);
+	array = buffer_granule_map(gr, SLOT_RSI_CALL);
 	assert(array != NULL);
-	inv_dcache_range((uintptr_t)&array[index], sizeof(array[index]));
-	*ipa = array[index];
+	if (write) {
+		memcpy(array, batch, bytes);
+		clean_dcache_range((uintptr_t)array, bytes);
+	} else {
+		inv_dcache_range((uintptr_t)array, bytes);
+		memcpy(batch, array, bytes);
+	}
 	buffer_unmap(array);
-	granule_unlock(array_walk.llt);
-
+	granule_unlock(walk.llt);
 	return true;
 }
 
-static bool opencca_gpu_write_entry(struct rec *rec, unsigned long array_ipa,
-				    unsigned long index, unsigned long pa,
-				    struct rsi_result *res)
+static bool valid_array(struct rec *rec, unsigned long ipa, unsigned long count)
 {
-	enum s2_walk_status walk_status;
-	struct s2_walk_result array_walk;
-	struct granule *gr;
-	unsigned long *array;
-
-	walk_status = realm_ipa_to_pa(rec, array_ipa, &array_walk);
-	switch (walk_status) {
-	case WALK_SUCCESS:
-		break;
-	case WALK_FAIL:
-		if (array_walk.ripas_val == RIPAS_EMPTY) {
-			res->smc_res.x[0] = RSI_ERROR_INPUT;
-		} else {
-			res->action = STAGE_2_TRANSLATION_FAULT;
-			res->rtt_level = array_walk.rtt_level;
-		}
-		return false;
-	case WALK_INVALID_PARAMS:
-	default:
-		res->smc_res.x[0] = RSI_ERROR_INPUT;
-		return false;
-	}
-
-	gr = find_granule(array_walk.pa);
-	assert(gr != NULL);
-	array = (unsigned long *)buffer_granule_map(gr, SLOT_RSI_CALL);
-	assert(array != NULL);
-	array[index] = pa;
-	clean_dcache_range((uintptr_t)&array[index], sizeof(array[index]));
-	buffer_unmap(array);
-	granule_unlock(array_walk.llt);
-
-	return true;
-}
-
-static bool opencca_gpu_track_mapping(struct rec *rec, unsigned long hpa,
-				      struct rsi_result *res)
-{
-	int free_idx = -1;
-
-	spinlock_acquire(&opencca_gpu_mappings_lock);
-	for (unsigned int i = 0U; i < OPENCCA_GPU_MAPPING_MAX; i++) {
-		if (opencca_gpu_mappings[i].active &&
-		    (opencca_gpu_mappings[i].hpa == hpa)) {
-			if ((opencca_gpu_mappings[i].rd != rec->realm_info.g_rd) ||
-			    (opencca_gpu_mappings[i].refcount == USHRT_MAX)) {
-				spinlock_release(&opencca_gpu_mappings_lock);
-				res->smc_res.x[0] = RSI_ERROR_INPUT;
-				return false;
-			}
-			opencca_gpu_mappings[i].refcount++;
-			spinlock_release(&opencca_gpu_mappings_lock);
-			return true;
-		}
-
-		if (!opencca_gpu_mappings[i].active && (free_idx < 0)) {
-			free_idx = (int)i;
-		}
-	}
-
-	if (free_idx < 0) {
-		spinlock_release(&opencca_gpu_mappings_lock);
-		res->smc_res.x[0] = RSI_ERROR_INPUT;
-		return false;
-	}
-
-	opencca_gpu_mappings[free_idx].rd = rec->realm_info.g_rd;
-	opencca_gpu_mappings[free_idx].hpa = hpa;
-	opencca_gpu_mappings[free_idx].refcount = 1U;
-	opencca_gpu_mappings[free_idx].active = true;
-	opencca_gpu_mappings_active++;
-	if (opencca_gpu_map_log_budget > 0U) {
-		INFO("[MZH][OPENCCA_GPU_MAP] rd=0x%lx hpa=0x%lx active=%u\n",
-		     granule_addr(rec->realm_info.g_rd), hpa,
-		     opencca_gpu_mappings_active);
-		opencca_gpu_map_log_budget--;
-	}
-	spinlock_release(&opencca_gpu_mappings_lock);
-
-	return true;
-}
-
-static void opencca_gpu_untrack_hpa(struct rec *rec, unsigned long hpa)
-{
-	unsigned int active_after = 0U;
-
-	spinlock_acquire(&opencca_gpu_mappings_lock);
-	for (unsigned int i = 0U; i < OPENCCA_GPU_MAPPING_MAX; i++) {
-		if (!opencca_gpu_mappings[i].active ||
-		    (opencca_gpu_mappings[i].rd != rec->realm_info.g_rd) ||
-		    (opencca_gpu_mappings[i].hpa != hpa)) {
-			continue;
-		}
-
-		if (opencca_gpu_mappings[i].refcount > 1U) {
-			opencca_gpu_mappings[i].refcount--;
-			spinlock_release(&opencca_gpu_mappings_lock);
-			return;
-		}
-
-		opencca_gpu_clear_mapping_locked(i);
-		active_after = opencca_gpu_mappings_active;
-		spinlock_release(&opencca_gpu_mappings_lock);
-
-		if (opencca_gpu_unmap_log_budget > 0U) {
-			INFO("[MZH][OPENCCA_GPU_UNMAP] rd=0x%lx hpa=0x%lx active=%u\n",
-			     granule_addr(rec->realm_info.g_rd), hpa,
-			     active_after);
-			opencca_gpu_unmap_log_budget--;
-		}
-
-		return;
-	}
-	spinlock_release(&opencca_gpu_mappings_lock);
+	return GRANULE_ALIGNED(ipa) && addr_in_rec_par(rec, ipa) &&
+	       count != 0UL && count <= OPENCCA_GPA_TO_HPA_MAX_ENTRIES;
 }
 
 void opencca_gpu_release_realm_mappings(struct granule *g_rd)
 {
-	unsigned int released = 0U;
-	unsigned int active_after = 0U;
+	unsigned int released, active;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	for (unsigned int i = 0U; i < OPENCCA_GPU_MAPPING_MAX; i++) {
-		if (opencca_gpu_mappings[i].active &&
-		    (opencca_gpu_mappings[i].rd == g_rd)) {
-			opencca_gpu_clear_mapping_locked(i);
-			released++;
-		}
-	}
-	active_after = opencca_gpu_mappings_active;
+	released = opencca_gpu_lease_release_owner(g_rd);
+	active = opencca_gpu_lease_active();
 	spinlock_release(&opencca_gpu_mappings_lock);
-
-	if (released != 0U) {
+	if (released != 0U)
 		INFO("[MZH][OPENCCA_GPU_UNMAP_ALL] rd=0x%lx released=%u active=%u\n",
-		     granule_addr(g_rd), released, active_after);
-	}
+		     granule_addr(g_rd), released, active);
 }
 
 void handle_rsi_opencca_gpa_to_hpa(struct rec *rec, struct rsi_result *res)
 {
-	unsigned long array_ipa = rec->regs[1];
-	unsigned long count = rec->regs[2];
-	unsigned long i;
+	unsigned long array_ipa = rec->regs[1], count = rec->regs[2];
+	unsigned int cpu = my_cpuid();
+	unsigned long *batch;
+	bool acquired;
 
 	res->action = UPDATE_REC_RETURN_TO_REALM;
-
-	if (!GRANULE_ALIGNED(array_ipa) ||
-	    !addr_in_rec_par(rec, array_ipa) ||
-	    (count == 0UL) ||
-	    (count > OPENCCA_GPA_TO_HPA_MAX_ENTRIES)) {
+	if (!valid_array(rec, array_ipa, count)) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;
 		return;
 	}
-
-	for (i = 0UL; i < count; i++) {
-		enum s2_walk_status walk_status;
-		unsigned long ipa;
-		unsigned long pa;
-		unsigned long rtt_level = 0UL;
+	assert(cpu < MAX_CPUS);
+	batch = gpu_batch[cpu];
+	if (!access_array(rec, array_ipa, batch, count, false, res))
+		return;
+	for (unsigned long i = 0UL; i < count; i++) {
+		unsigned long ipa = batch[i], level = 0UL;
 		enum ripas ripas = RIPAS_EMPTY;
-
-		if (!opencca_gpu_read_entry(rec, array_ipa, i, &ipa, res)) {
-			return;
-		}
+		enum s2_walk_status status;
 
 		if (!GRANULE_ALIGNED(ipa) || !addr_in_rec_par(rec, ipa)) {
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
 			return;
 		}
-
-		walk_status = opencca_gpu_ipa_to_pa(rec, ipa, &pa, &rtt_level,
-						    &ripas);
-		if (walk_status == WALK_INVALID_PARAMS ||
-		    (walk_status == WALK_FAIL && ripas == RIPAS_EMPTY)) {
+		status = opencca_gpu_ipa_to_pa(rec, ipa, &batch[i], &level, &ripas);
+		if (status == WALK_INVALID_PARAMS ||
+		    (status == WALK_FAIL && ripas == RIPAS_EMPTY)) {
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
 			return;
 		}
-
-		if (walk_status == WALK_FAIL) {
+		if (status == WALK_FAIL) {
 			res->action = STAGE_2_TRANSLATION_FAULT;
-			res->rtt_level = rtt_level;
-			return;
-		}
-
-		if (!opencca_gpu_track_mapping(rec, pa, res)) {
-			return;
-		}
-
-		if (!opencca_gpu_write_entry(rec, array_ipa, i, pa, res)) {
-			opencca_gpu_untrack_hpa(rec, pa);
+			res->rtt_level = level;
 			return;
 		}
 	}
-
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	acquired = opencca_gpu_lease_acquire(rec->realm_info.g_rd, batch, count);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	if (!acquired) {
+		res->smc_res.x[0] = RSI_ERROR_INPUT;
+		return;
+	}
+	if (!access_array(rec, array_ipa, batch, count, true, res)) {
+		spinlock_acquire(&opencca_gpu_mappings_lock);
+		opencca_gpu_lease_release(rec->realm_info.g_rd, batch, count);
+		spinlock_release(&opencca_gpu_mappings_lock);
+		return;
+	}
 	res->smc_res.x[0] = RSI_SUCCESS;
 }
 
 void handle_rsi_opencca_gpu_revoke(struct rec *rec, struct rsi_result *res)
 {
-	unsigned long array_ipa = rec->regs[1];
-	unsigned long count = rec->regs[2];
-	unsigned long i;
+	unsigned long array_ipa = rec->regs[1], count = rec->regs[2];
+	unsigned int cpu = my_cpuid();
+	unsigned long *batch;
 
 	res->action = UPDATE_REC_RETURN_TO_REALM;
-
-	if (!GRANULE_ALIGNED(array_ipa) ||
-	    !addr_in_rec_par(rec, array_ipa) ||
-	    (count == 0UL) ||
-	    (count > OPENCCA_GPA_TO_HPA_MAX_ENTRIES)) {
+	if (!valid_array(rec, array_ipa, count)) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;
 		return;
 	}
-
-	for (i = 0UL; i < count; i++) {
-		unsigned long hpa;
-
-		if (!opencca_gpu_read_entry(rec, array_ipa, i, &hpa, res)) {
-			return;
-		}
-
-		if (!GRANULE_ALIGNED(hpa)) {
+	assert(cpu < MAX_CPUS);
+	batch = gpu_batch[cpu];
+	if (!access_array(rec, array_ipa, batch, count, false, res))
+		return;
+	for (unsigned long i = 0UL; i < count; i++) {
+		if (!GRANULE_ALIGNED(batch[i])) {
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
 			return;
 		}
-
-		opencca_gpu_untrack_hpa(rec, hpa);
 	}
-
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	opencca_gpu_lease_release(rec->realm_info.g_rd, batch, count);
+	spinlock_release(&opencca_gpu_mappings_lock);
 	res->smc_res.x[0] = RSI_SUCCESS;
 }

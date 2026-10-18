@@ -138,23 +138,24 @@ function(Git_Apply_Patches Git_Repo Patch_Files_List)
     return()
   endif()
 
-  # todo: Remove 'checkout' and 'clean' commands.
-  # These commands does a force reset and removes untracked files. If an user
-  # has some work in progress changes in 'Git_Repo', then Git_Apply_Patches will
-  # force delete the changes.
-  execute_process(
-    WORKING_DIRECTORY ${Git_Repo}
-    # removes changes that are not staged
-    COMMAND ${GIT_EXECUTABLE} checkout .
-    )
-  execute_process(
-    WORKING_DIRECTORY ${Git_Repo}
-    # removes changes that are not tracked
-    COMMAND ${GIT_EXECUTABLE} clean -f
-    )
-
-  # todo: For applying patches use -am option, this retains commit history.
+  # Reconfiguration must preserve local work and already-applied patches.
   foreach(PATCH_FILE IN LISTS Patch_Files_List)
+    execute_process(
+      WORKING_DIRECTORY ${Git_Repo}
+      COMMAND ${GIT_EXECUTABLE} apply --reverse --check ${PATCH_FILE}
+      RESULT_VARIABLE PATCH_APPLIED
+      OUTPUT_QUIET ERROR_QUIET)
+    if(PATCH_APPLIED EQUAL 0)
+      continue()
+    endif()
+    execute_process(
+      WORKING_DIRECTORY ${Git_Repo}
+      COMMAND ${GIT_EXECUTABLE} apply --check ${PATCH_FILE}
+      RESULT_VARIABLE PATCH_CHECK
+      OUTPUT_QUIET ERROR_QUIET)
+    if(NOT PATCH_CHECK EQUAL 0)
+      message(FATAL_ERROR "Local changes conflict with ${PATCH_FILE} at ${Git_Repo}; no files reset")
+    endif()
     execute_process(
       WORKING_DIRECTORY ${Git_Repo}
       COMMAND ${GIT_EXECUTABLE} apply --verbose ${PATCH_FILE}

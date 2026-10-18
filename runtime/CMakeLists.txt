@@ -77,7 +77,12 @@ target_sources(rmm-runtime
             "core/sysregs.c"
             "core/timers.c"
             "core/opencca_fwb.c"
-            "core/opencca_timers.c")
+            "core/opencca_timers.c"
+            "core/opencca_gpu_lease.c")
+
+target_sources(rmm-runtime PRIVATE "core/xshm_irq.c"
+    "core/xshm_endpoint.c" "core/xshm_memory.c"
+    "core/xshm_service.c" "core/xshm_policy.c" "core/xshm_rtt.c" "rsi/xshm.c")
 
 target_sources(rmm-runtime
     PRIVATE "rmi/feature.c"

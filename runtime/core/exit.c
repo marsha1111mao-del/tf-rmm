@@ -448,6 +448,9 @@ static bool handle_realm_rsi(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	case SMC_RSI_OPENCCA_GPU_REVOKE:
 		handle_rsi_opencca_gpu_revoke(rec, &res);
 		break;
+	case SMC_RSI_OPENCCA_XSHM:
+		handle_rsi_opencca_xshm(rec, rec_exit, &res);
+		break;
 	case SMC_RSI_OPENCCA_GPA_TO_HPA:
 		handle_rsi_opencca_gpa_to_hpa(rec, &res);
 		break;

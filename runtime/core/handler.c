@@ -17,6 +17,7 @@
 #include <status.h>
 #include <utils_def.h>
 #include <xlat_high_va.h>
+#include <xshm_runtime.h>
 
 /* Maximum number of supported arguments */
 #define MAX_NUM_ARGS		5U
@@ -292,6 +293,18 @@ void handle_ns_smc(unsigned int function_id,
 		restore_ns_simd_state = true;
 	}
 
+	/* Serialize ownership mutations with cross-Realm aliases. REC_ENTER
+	 * must remain outside this gate: it executes arbitrary Realm code. */
+	if (function_id != SMC_RMI_REC_ENTER) {
+		xshm_policy_lock();
+		if (!xshm_rmi_allowed(function_id, arg0, arg1, arg2, arg3)) {
+			for (unsigned int i = 0U; i < SMC_RESULT_REGS; i++)
+				res->x[i] = 0UL;
+			res->x[0] = RMI_ERROR_INPUT;
+			goto release_policy;
+		}
+	}
+
 	switch (handler->type) {
 	case rmi_type_00:
 		res->x[0] = handler->f_00();
@@ -336,6 +349,9 @@ void handle_ns_smc(unsigned int function_id,
 		assert(false);
 	}
 
+release_policy:
+	if (function_id != SMC_RMI_REC_ENTER)
+		xshm_policy_unlock();
 	rmi_log_on_exit(handler_id, args, res);
 
 	/* If the handler uses FPU, restore the saved NS simd context. */

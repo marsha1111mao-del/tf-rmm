@@ -96,6 +96,9 @@ void handle_rsi_attest_token_continue(struct rec *rec,
 void handle_rsi_opencca_gpa_to_hpa(struct rec *rec, struct rsi_result *res);
 void handle_rsi_opencca_gpu_revoke(struct rec *rec, struct rsi_result *res);
 void opencca_gpu_release_realm_mappings(struct granule *g_rd);
+void handle_rsi_opencca_xshm(struct rec *rec, struct rmi_rec_exit *rec_exit,
+			      struct rsi_result *res);
+void opencca_xshm_release_realm(struct granule *g_rd);
 void handle_psci(struct rec *rec, struct rmi_rec_exit *rec_exit,
 		 struct rsi_result *res);
 

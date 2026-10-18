@@ -3,6 +3,9 @@
  * SPDX-FileCopyrightText: Copyright TF-RMM Contributors.
  */
 
+#include <xshm_irq.h>
+#include <xshm_endpoint.h>
+#include <xshm_runtime.h>
 #include <arch.h>
 #include <buffer.h>
 #include <debug.h>
@@ -267,7 +270,9 @@ unsigned long smc_rec_enter(unsigned long rec_addr,
 	 * Check GIC state after checking other conditions but before doing
 	 * anything which may have side effects.
 	 */
-	if (!gic_validate_state(&rec_run.enter)) {
+	if (!xshm_irq_host_valid(rec_run.enter.gicv3_lrs,
+				  gic_vgic_get_num_lrs() + 1U) ||
+	    !gic_validate_state(&rec_run.enter)) {
 		ret = RMI_ERROR_REC;
 		goto out_unmap_buffers;
 	}
@@ -314,6 +319,13 @@ unsigned long smc_rec_enter(unsigned long rec_addr,
 
 	ret = RMI_SUCCESS;
 
+	if (rec->rec_idx == 0UL) {
+		xshm_policy_lock();
+		if (xshm_endpoint_irq_take(rec->realm_info.g_rd))
+			xshm_irq_inject(rec->sysregs.gicstate.ich_lr_el2,
+					gic_vgic_get_num_lrs() + 1U);
+		xshm_policy_unlock();
+	}
 	rec_run_loop(rec, &rec_run.exit);
 
 	gic_copy_state_to_rec_exit(&rec->sysregs.gicstate, &rec_run.exit);

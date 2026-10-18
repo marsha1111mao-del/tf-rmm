@@ -540,6 +540,7 @@ unsigned long smc_realm_destroy(unsigned long rd_addr)
 	vmid_free(rd->s2_ctx.vmid);
 	buffer_unmap(rd);
 	opencca_gpu_release_realm_mappings(g_rd);
+	opencca_xshm_release_realm(g_rd);
 
 	free_sl_rtts(g_rtt, num_rtts);
 

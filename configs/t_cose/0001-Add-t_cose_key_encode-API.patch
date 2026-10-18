@@ -29,22 +29,21 @@ index a757e9e..cdf5557 100644
  #ifdef __cplusplus
  }
 diff --git a/src/t_cose_key.c b/src/t_cose_key.c
-index 0ce88f5..6b134d1 100644
+index 0ce88f5..483f250 100644
 --- a/src/t_cose_key.c
 +++ b/src/t_cose_key.c
-@@ -8,8 +8,11 @@
+@@ -8,8 +8,10 @@
   *
   * See BSD-3-Clause license in README.md
   */
 +#include "qcbor/qcbor_encode.h"
  #include "t_cose/t_cose_key.h"
  #include "t_cose_crypto.h"
-+#include "t_cose_crypto.h"
 +#include "t_cose_util.h"
  
  
  /*
-@@ -35,3 +38,59 @@ t_cose_key_free_symmetric(struct t_cose_key key)
+@@ -35,3 +37,59 @@ t_cose_key_free_symmetric(struct t_cose_key key)
      t_cose_crypto_free_symmetric_key(key);
  }
  
