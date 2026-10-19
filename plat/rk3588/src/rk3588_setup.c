@@ -65,6 +65,15 @@ void plat_setup(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3)
 
 	/* TBD Initialize UART for early log */
 	struct xlat_mmap_region plat_regions[] = {
+		/* Accesses are authorized by the GPU/IOMMU services. OpenCCA
+		 * models the GPC restriction on untrusted CPU accesses.
+		 */
+		MAP_REGION_FLAT(0xfb000000UL, SZ_2M,
+				(MT_DEVICE | MT_RW | MT_REALM)),
+		MAP_REGION_FLAT(0xfd800000UL, 8UL * SZ_1M,
+				(MT_DEVICE | MT_RW | MT_REALM)),
+		MAP_REGION_FLAT(0xfe680000UL, SZ_1M,
+				(MT_DEVICE | MT_RW | MT_REALM)),
 		ARM_RMM_UART,
 		{0}
 	};
@@ -113,14 +122,14 @@ void plat_setup(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3)
 			rmm_el3_ifc_report_fail_to_el3(E_RMM_BOOT_UNKNOWN_ERROR);
 		}
 
-		plat_regions[0].base_pa = uart_base;
-		plat_regions[0].base_va = uart_base;
+		plat_regions[3].base_pa = uart_base;
+		plat_regions[3].base_va = uart_base;
 	}
 
 	VERBOSE("console enabled\n");	
 
 	/* Carry on with the rest of the system setup */
-	ret = plat_cmn_setup(plat_regions, 1U);
+	ret = plat_cmn_setup(plat_regions, 4U);
 	if (ret != 0) {
 		ERROR("%s (%u): Failed to setup the platform (%i)\n",
 			__func__, __LINE__, ret);

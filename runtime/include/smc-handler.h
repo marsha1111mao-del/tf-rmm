@@ -8,6 +8,17 @@
 
 #include <smc.h>
 
+unsigned long smc_opencca_dma_guard(unsigned long op, unsigned long domain,
+				    unsigned long iova, unsigned long pa,
+				    unsigned long size);
+void smc_opencca_dma_status(unsigned long selector, struct smc_result *res);
+void smc_opencca_iommu(unsigned long operation, unsigned long handle,
+		       unsigned long arg1, unsigned long arg2,
+		       unsigned long arg3, struct smc_result *res);
+unsigned long smc_opencca_gpu_mmio_grant(unsigned long rd_addr);
+void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
+			unsigned long error, struct smc_result *res);
+
 void smc_version(unsigned long rmi_version,
 				struct smc_result *res);
 

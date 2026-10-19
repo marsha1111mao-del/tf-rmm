@@ -13,7 +13,7 @@ add_library(rmm-plat-rk3588)
 #
 # Extra memory regions needed by this platform
 #
-arm_config_option_override(NAME PLAT_CMN_EXTRA_MMAP_REGIONS DEFAULT 1)
+arm_config_option_override(NAME PLAT_CMN_EXTRA_MMAP_REGIONS FORCE 4)
 
 # add_subdirectory("${RMM_SOURCE_DIR}/drivers/pl011" ${RMM_BINARY_DIR}/drivers/pl011)
 add_subdirectory("${RMM_SOURCE_DIR}/drivers/16550" ${RMM_BINARY_DIR}/drivers/16550)
@@ -34,10 +34,15 @@ target_link_libraries(rmm-plat-rk3588
 
 target_sources(rmm-plat-rk3588
     PRIVATE "src/rk3588_setup.c"
+            "src/rk3588_iommu.c"
+            "src/rk3588_gpu.c"
+            "src/rk3588_timers.c"
             "src/rk3588_granule.c"
             "src/rk3588_memory.c")
 
 target_include_directories(rmm-plat-rk3588
     PRIVATE "src/include")
+target_include_directories(rmm-plat-rk3588
+    PRIVATE "${RMM_SOURCE_DIR}/runtime/include")
 
 add_library(rmm-platform ALIAS rmm-plat-rk3588)

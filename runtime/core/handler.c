@@ -64,6 +64,9 @@ typedef void (*handler_3_o)(unsigned long arg0, unsigned long arg1,
 typedef void (*handler_4_o)(unsigned long arg0, unsigned long arg1,
 			    unsigned long arg2, unsigned long arg3,
 			    struct smc_result *res);
+typedef void (*handler_5_o)(unsigned long arg0, unsigned long arg1,
+			    unsigned long arg2, unsigned long arg3,
+			    unsigned long arg4, struct smc_result *res);
 
 /*
  * SMC RMI handler type encoding:
@@ -86,7 +89,8 @@ enum rmi_type {
 	set_rmi_type(3, 1),	/* 3 arguments, 1 output value */
 	set_rmi_type(3, 2),	/* 3 arguments, 2 output values */
 	set_rmi_type(3, 4),	/* 3 arguments, 4 output values */
-	set_rmi_type(4, 1)	/* 4 arguments, 1 output value */
+	set_rmi_type(4, 1),	/* 4 arguments, 1 output value */
+	set_rmi_type(5, 4)	/* 5 arguments, 4 output values */
 };
 
 struct smc_handler {
@@ -105,6 +109,7 @@ struct smc_handler {
 		handler_3_o	f_32;
 		handler_3_o	f_34;
 		handler_4_o	f_41;
+		handler_5_o	f_54;
 		void		*fn_dummy;
 	};
 	enum rmi_type	type;
@@ -153,7 +158,14 @@ static const struct smc_handler smc_handlers[] = {
 	HANDLER(PSCI_COMPLETE,		3, 0, smc_psci_complete,	 true,  true),
 	HANDLER(REC_AUX_COUNT,		1, 1, smc_rec_aux_count,	 true,  true),
 	HANDLER(RTT_INIT_RIPAS,		3, 1, smc_rtt_init_ripas,	 false, true),
-	HANDLER(RTT_SET_RIPAS,		4, 1, smc_rtt_set_ripas,	 false, true)
+	HANDLER(RTT_SET_RIPAS,		4, 1, smc_rtt_set_ripas,	 false, true),
+	HANDLER(OPENCCA_DMA_GUARD,	5, 0, smc_opencca_dma_guard, false, false),
+	HANDLER(OPENCCA_DMA_STATUS,	1, 2, smc_opencca_dma_status, false, false),
+	HANDLER(OPENCCA_IOMMU,		5, 4, smc_opencca_iommu,	 false, false),
+	HANDLER(OPENCCA_GPU_MMIO_GRANT,	1, 0, smc_opencca_gpu_mmio_grant,
+		false, false),
+	HANDLER(OPENCCA_GPU_PM,		3, 4, smc_opencca_gpu_pm,
+		false, false)
 };
 
 COMPILER_ASSERT(ARRAY_SIZE(smc_handlers) == SMC64_NUM_FIDS_IN_RANGE(RMI));
@@ -344,6 +356,9 @@ void handle_ns_smc(unsigned int function_id,
 		break;
 	case rmi_type_41:
 		handler->f_41(arg0, arg1, arg2, arg3, res);
+		break;
+	case rmi_type_54:
+		handler->f_54(arg0, arg1, arg2, arg3, arg4, res);
 		break;
 	default:
 		assert(false);

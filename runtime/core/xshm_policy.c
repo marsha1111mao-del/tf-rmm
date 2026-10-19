@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <granule.h>
+#include <opencca_iommu.h>
 #include <s2tt.h>
 #include <smc-rmi.h>
 #include <spinlock.h>
@@ -29,7 +30,8 @@ bool xshm_rmi_allowed(unsigned int fid, unsigned long arg0,
 		return true;
 	switch (fid) {
 	case SMC_RMI_REALM_DESTROY:
-		return !xshm_memory_owner_busy(owner);
+		return !xshm_memory_owner_busy(owner) &&
+		       !opencca_iommu_owner_busy(owner);
 	case SMC_RMI_DATA_CREATE:
 	case SMC_RMI_DATA_CREATE_UNKNOWN:
 		base = arg2;
@@ -60,5 +62,6 @@ bool xshm_rmi_allowed(unsigned int fid, unsigned long arg0,
 		 * UNPROTECTED operations cannot touch protected IPA entries. */
 		return true;
 	}
-	return !xshm_memory_range_busy(owner, base, size);
+	return !xshm_memory_range_busy(owner, base, size) &&
+	       !opencca_iommu_range_busy(owner, base, size);
 }

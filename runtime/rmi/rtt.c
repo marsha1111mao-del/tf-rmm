@@ -9,6 +9,9 @@
 #include <errno.h>
 #include <granule.h>
 #include <measurement.h>
+#include <opencca_gpu.h>
+#include <opencca_gpu_lease.h>
+#include <opencca_iommu.h>
 #include <realm.h>
 #include <ripas.h>
 #include <s2tt.h>
@@ -102,6 +105,15 @@ unsigned long smc_rtt_create(unsigned long rd_addr,
 	assert(rd != NULL);
 
 	if (!validate_rtt_structure_cmds(map_addr, level, rd)) {
+		buffer_unmap(rd);
+		granule_unlock(g_rd);
+		granule_unlock(g_tbl);
+		return RMI_ERROR_INPUT;
+	}
+	if (level == S2TT_PAGE_LEVEL &&
+	    map_addr >= (OPENCCA_GPU_MMIO_BASE | realm_par_size(rd)) &&
+	    map_addr < (OPENCCA_GPU_MMIO_BASE | realm_par_size(rd)) +
+		       OPENCCA_GPU_MMIO_SIZE) {
 		buffer_unmap(rd);
 		granule_unlock(g_rd);
 		granule_unlock(g_tbl);
@@ -659,6 +671,20 @@ static void map_unmap_ns(unsigned long rd_addr,
 		res->x[0] = RMI_ERROR_INPUT;
 		return;
 	}
+	if (op == MAP_NS) {
+		unsigned long entry = s2tte_create_assigned_ns(&s2_ctx, host_s2tte, level);
+		unsigned long pa = s2tte_pa(&s2_ctx, entry, level);
+		unsigned long size = s2tte_map_size(level);
+
+		if (!opencca_gpu_authorize_mapping(g_rd, map_addr, pa, size,
+						  realm_par_size(rd)) ||
+		    plat_opencca_iommu_mmio_overlaps(pa, size)) {
+			buffer_unmap(rd);
+			granule_unlock(g_rd);
+			res->x[0] = RMI_ERROR_INPUT;
+			return;
+		}
+	}
 
 	/* Check if map_addr is outside PAR */
 	if (addr_in_par(rd, map_addr)) {
@@ -765,6 +791,54 @@ void smc_rtt_unmap_unprotected(unsigned long rd_addr,
 	}
 
 	map_unmap_ns(rd_addr, map_addr, level, 0UL, UNMAP_NS, res);
+}
+
+bool opencca_gpu_revoke_mmio(const void *owner)
+{
+	const struct granule *g_owner = owner;
+	struct granule *g_rd;
+	struct rd *rd;
+	struct s2tt_context context;
+	struct s2tt_walk walk;
+	unsigned long *table, entry;
+	bool revoked;
+	long level = S2TT_MIN_BLOCK_LEVEL + 1L;
+	unsigned long map_addr;
+
+	if (g_owner == NULL) {
+		return false;
+	}
+
+	g_rd = find_lock_granule(granule_addr(g_owner), GRANULE_STATE_RD);
+	if (g_rd != g_owner) {
+		if (g_rd != NULL) {
+			granule_unlock(g_rd);
+		}
+		return false;
+	}
+
+	rd = buffer_granule_map(g_rd, SLOT_RD);
+	assert(rd != NULL);
+	map_addr = OPENCCA_GPU_MMIO_BASE | realm_par_size(rd);
+	context = rd->s2_ctx;
+	buffer_unmap(rd);
+	granule_lock(context.g_rtt, GRANULE_STATE_RTT);
+	granule_unlock(g_rd);
+
+	s2tt_walk_lock_unlock(&context, map_addr, level, &walk);
+	table = buffer_granule_map(walk.g_llt, SLOT_RTT);
+	assert(table != NULL);
+	entry = s2tte_read(&table[walk.index]);
+	revoked = s2tte_is_unassigned_ns(&context, entry);
+	if (!revoked && walk.last_level == level &&
+	    s2tte_is_assigned_ns(&context, entry, level)) {
+		s2tte_write(&table[walk.index], s2tte_create_unassigned_ns(&context));
+		s2tt_invalidate_block(&context, map_addr);
+		revoked = true;
+	}
+	buffer_unmap(table);
+	granule_unlock(walk.g_llt);
+	return revoked;
 }
 
 void smc_rtt_read_entry(unsigned long rd_addr,
@@ -1081,24 +1155,29 @@ void smc_data_destroy(unsigned long rd_addr,
 
 	s2tte = s2tte_read(&s2tt[wi.index]);
 
+	if (!s2tte_is_assigned_ram(&s2_ctx, s2tte, S2TT_PAGE_LEVEL) &&
+	    !s2tte_is_assigned_empty(&s2_ctx, s2tte, S2TT_PAGE_LEVEL) &&
+	    !s2tte_is_assigned_destroyed(&s2_ctx, s2tte, S2TT_PAGE_LEVEL)) {
+		res->x[0] = pack_return_code(RMI_ERROR_RTT,
+						(unsigned char)S2TT_PAGE_LEVEL);
+		goto out_unmap_ll_table;
+	}
+	data_addr = s2tte_pa(&s2_ctx, s2tte, S2TT_PAGE_LEVEL);
+	if (opencca_gpu_page_busy(data_addr)) {
+		res->x[0] = RMI_ERROR_INPUT;
+		goto out_unmap_ll_table;
+	}
+
 	if (s2tte_is_assigned_ram(&s2_ctx, s2tte, S2TT_PAGE_LEVEL)) {
-		data_addr = s2tte_pa(&s2_ctx, s2tte, S2TT_PAGE_LEVEL);
 		s2tte = s2tte_create_unassigned_destroyed(&s2_ctx);
 		s2tte_write(&s2tt[wi.index], s2tte);
 		s2tt_invalidate_page(&s2_ctx, map_addr);
 	} else if (s2tte_is_assigned_empty(&s2_ctx, s2tte, S2TT_PAGE_LEVEL)) {
-		data_addr = s2tte_pa(&s2_ctx, s2tte, S2TT_PAGE_LEVEL);
 		s2tte = s2tte_create_unassigned_empty(&s2_ctx);
 		s2tte_write(&s2tt[wi.index], s2tte);
-	} else if (s2tte_is_assigned_destroyed(&s2_ctx, s2tte,
-					       S2TT_PAGE_LEVEL)) {
-		data_addr = s2tte_pa(&s2_ctx, s2tte, S2TT_PAGE_LEVEL);
+	} else {
 		s2tte = s2tte_create_unassigned_destroyed(&s2_ctx);
 		s2tte_write(&s2tt[wi.index], s2tte);
-	} else {
-		res->x[0] = pack_return_code(RMI_ERROR_RTT,
-						(unsigned char)S2TT_PAGE_LEVEL);
-		goto out_unmap_ll_table;
 	}
 
 	atomic_granule_put(wi.g_llt);

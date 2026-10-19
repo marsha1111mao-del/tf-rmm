@@ -258,4 +258,10 @@ struct rsi_host_call {
  */
 #define SMC_RSI_OPENCCA_XSHM		SMC64_RSI_FID(U(0x1d))
 
+/* OpenCCA experimental managed IOMMU service. Shares the operation, handle,
+ * argument, status and result encoding with SMC_RMI_OPENCCA_IOMMU.
+ */
+#define SMC_RSI_OPENCCA_IOMMU		SMC64_RSI_FID(U(0x20))
+#define SMC_RSI_OPENCCA_GPU_CONTROL	SMC64_RSI_FID(U(0x21))
+
 #endif /* SMC_RSI_H */

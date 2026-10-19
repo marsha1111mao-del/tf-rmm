@@ -78,6 +78,8 @@ target_sources(rmm-runtime
             "core/timers.c"
             "core/opencca_fwb.c"
             "core/opencca_timers.c"
+            "core/opencca_iommu.c"
+            "core/opencca_gpu.c"
             "core/opencca_gpu_lease.c")
 
 target_sources(rmm-runtime PRIVATE "core/xshm_irq.c"
@@ -121,6 +123,7 @@ target_sources(rmm-runtime
             "rsi/opencca_gpu.c"
             "rsi/psci.c"
             "rsi/realm_ipa_helper.c"
+            "rsi/opencca_iommu.c"
             "rsi/realm_attest.c"
             "rsi/system.c")
 

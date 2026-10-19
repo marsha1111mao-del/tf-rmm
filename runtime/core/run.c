@@ -309,6 +309,9 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	attestation_heap_ctx_assign_pe(&rec->aux_data.attest_data->alloc_ctx);
 
 	save_ns_state(rec);
+#if ENABLE_OPENCCA
+	plat_opencca_timers_save();
+#endif
 	restore_realm_state(rec);
 
 	/*
@@ -317,10 +320,6 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	 */
 	assert(rec->active_simd_ctx == NULL);
 	rec->active_simd_ctx = &g_ns_simd_ctx[cpuid];
-
-	#if ENABLE_OPENCCA
-	struct simd_context *last_rec_active_simd_ctx = rec->active_simd_ctx;
-	#endif
 
 	do {
 		unsigned long rmm_cptr_el2 = read_cptr_el2();
@@ -332,11 +331,7 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 		 * change in output level to the NS caller.
 		 */
 		#if ENABLE_OPENCCA
-		/* Opencca: No Enhanced Counter Virtualization (ECV)*/
-		int is_simd_trap = 
-				last_rec_active_simd_ctx->owner == SIMD_OWNER_NWD
-				&& rec->active_simd_ctx->owner == SIMD_OWNER_REL1;
-		if (opencca_check_pending_timers(rec, is_simd_trap)) {
+		if (opencca_check_pending_timers(rec)) {
 		#else
 		if (check_pending_timers(rec)) {
 		#endif
@@ -360,10 +355,6 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 		pauth_restore_realm_keys(&rec->pauth);
 
 		realm_exception_code = run_realm(&rec->regs[0]);
-
-		#if ENABLE_OPENCCA
-		last_rec_active_simd_ctx = rec->active_simd_ctx;
-		#endif
 
 		/* Save Realm PAuth key. */
 		pauth_save_realm_keys(&rec->pauth);
@@ -400,6 +391,9 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 
 	save_realm_state(rec, rec_exit);
 	restore_ns_state(rec);
+#if ENABLE_OPENCCA
+	plat_opencca_timers_restore();
+#endif
 
 	/*
 	 * Clear NS pointer since that struct is local to this function.

@@ -42,6 +42,12 @@ bool vmid_reserve(unsigned int vmid)
 		return false;
 	}
 
+#if ENABLE_OPENCCA
+	if (vmid < (vmid_count / 2U)) {
+		return false;
+	}
+#endif
+
 	offset = vmid / BITS_PER_UL;
 	vmid %= BITS_PER_UL;
 
@@ -61,6 +67,9 @@ void vmid_free(unsigned int vmid)
 
 	/* Check the number of supported VMID values */
 	assert(vmid < vmid_count);
+#if ENABLE_OPENCCA
+	assert(vmid >= (vmid_count / 2U));
+#endif
 
 	offset = vmid / BITS_PER_UL;
 	vmid %= BITS_PER_UL;

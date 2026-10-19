@@ -53,6 +53,7 @@ static inline bool is_feat_rng_present(void)
 	return (EXTRACT(ID_AA64ISAR0_EL1_RNDR,
 		read_id_aa64isar0_el1()) != 0UL);
 }
+#endif
 
 /*
  * Check if FEAT_VMID16 is implemented
@@ -67,6 +68,7 @@ static inline bool is_feat_vmid16_present(void)
 		read_id_aa64mmfr1_el1()) == ID_AA64MMFR1_EL1_VMIDBits_16);
 }
 
+#if !(ENABLE_OPENCCA)
 /*
  * Check if FEAT_LPA2 is implemented for stage 1.
  * 4KB granule at stage 1 supports 52-bit input and output addresses:

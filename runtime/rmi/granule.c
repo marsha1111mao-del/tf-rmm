@@ -6,6 +6,7 @@
 #include <buffer.h>
 #include <debug.h>
 #include <granule.h>
+#include <opencca_gpu_lease.h>
 #include <rmm_el3_ifc.h>
 #include <smc-handler.h>
 #include <smc-rmi.h>
@@ -14,6 +15,12 @@
 unsigned long smc_granule_delegate(unsigned long addr)
 {
 	struct granule *g;
+
+	/* Paired with DMA admission under the outer RMI policy lock. A device
+	 * mapping must be unmapped and invalidated before delegation can proceed.
+	 */
+	if (opencca_gpu_dma_busy(addr, GRANULE_SIZE))
+		return RMI_ERROR_INPUT;
 
 	g = find_lock_granule(addr, GRANULE_STATE_NS);
 	if (g == NULL) {

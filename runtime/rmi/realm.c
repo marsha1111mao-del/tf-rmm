@@ -10,6 +10,7 @@
 #include <feature.h>
 #include <granule.h>
 #include <measurement.h>
+
 #include <realm.h>
 #include <rsi-handler.h>
 #include <s2tt.h>
@@ -525,7 +526,14 @@ unsigned long smc_realm_destroy(unsigned long rd_addr)
 	num_rtts = rd->s2_ctx.num_root_rtts;
 
 	/* Check if granules are unused */
-	if (total_root_rtt_refcount(g_rtt, num_rtts) != 0UL) {
+	unsigned long root_refcount = total_root_rtt_refcount(g_rtt, num_rtts);
+
+	if (root_refcount != 0UL) {
+		buffer_unmap(rd);
+		granule_unlock(g_rd);
+		return RMI_ERROR_REALM;
+	}
+	if (!opencca_gpu_pm_destroy_allowed(g_rd)) {
 		buffer_unmap(rd);
 		granule_unlock(g_rd);
 		return RMI_ERROR_REALM;

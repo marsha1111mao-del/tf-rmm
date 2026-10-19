@@ -35,6 +35,26 @@
 
 #define SMC64_RMI_FID(_offset)		SMC64_STD_FID(RMI, _offset)
 
+/* OpenCCA development extension, ABI 1. Mapping admission only: platform
+ * register/table protection is required before claiming hostile-Host DMA
+ * isolation. MAP: op=1, domain, IOVA, PA, size. UNMAP: op=2, domain, IOVA,
+ * reserved=0, size, only after completed device IOTLB invalidation.
+ */
+#define SMC_RMI_OPENCCA_DMA_GUARD SMC64_RMI_FID(U(0x1A))
+#define SMC_RMI_OPENCCA_DMA_STATUS SMC64_RMI_FID(U(0x1B))
+/* Managed-table ABI shared with RSI: x1=operation, x2=handle,
+ * x3..x5=operation arguments, x0=status, x1..x4=result.
+ */
+#define SMC_RMI_OPENCCA_IOMMU SMC64_RMI_FID(U(0x1C))
+/* Grants the single GPU MMIO window to one live Realm. The owner is revoked
+ * during RMI_REALM_DESTROY; a second Realm is rejected until then.
+ */
+#define SMC_RMI_OPENCCA_GPU_MMIO_GRANT SMC64_RMI_FID(U(0x1D))
+/* Coordinates the single GPU owner through Host reset/power transitions.
+ * x1 is one of OPENCCA_GPU_PM_* in the RMM lease header.
+ */
+#define SMC_RMI_OPENCCA_GPU_PM SMC64_RMI_FID(U(0x1E))
+
 #define IS_SMC64_RMI_FID(_fid)		IS_SMC64_STD_FAST_IN_RANGE(RMI, _fid)
 
 /* Command completed successfully. index is zero. */

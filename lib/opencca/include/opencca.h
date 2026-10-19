@@ -68,7 +68,6 @@ static inline bool arch_collect_entropy(uint64_t *random)
 
 FN_RETURN_BOOL(is_armv8_4_ttst_present, false)
 FN_RETURN_BOOL(is_feat_sme_present, false)
-FN_RETURN_BOOL(is_feat_vmid16_present, false)
 FN_RETURN_BOOL(is_feat_lpa2_4k_present, false)
 FN_RETURN_BOOL(is_feat_lpa2_4k_2_present, false)
 FN_RETURN_BOOL(is_feat_hpmn0_present, false)
@@ -164,7 +163,6 @@ bool opencca_handle_esr_tvm_sysreg_trap(struct rec* rec,
                 unsigned long esr);
 
 void opencca_stage2_flush_realm(struct rec* rec);
-bool opencca_check_pending_timers(struct rec* rec, int simd_trap);
 
 
 #endif /* not __ASSEMBLER__ */
