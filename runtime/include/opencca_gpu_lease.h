@@ -6,11 +6,11 @@
 #include <opencca_gpu.h>
 #include <stddef.h>
 
-/* Global bound: 512 MiB of distinct 4 KiB pages, including firmware/tables.
+/* Global bound: 2 GiB of distinct 4 KiB pages, including firmware/tables.
  * Software ownership metadata only; this does not configure device or GPT
  * permissions. Callers serialize every operation with the same lock.
  */
-#define OPENCCA_GPU_LEASE_CAPACITY 131072U
+#define OPENCCA_GPU_LEASE_CAPACITY 524288U
 #define OPENCCA_GPU_LEASE_BATCH 512U
 
 bool opencca_gpu_lease_acquire(const void *owner, const unsigned long *hpas,

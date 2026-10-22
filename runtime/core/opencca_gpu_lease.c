@@ -3,7 +3,7 @@
 #include <opencca_gpu_lease.h>
 #include <stdint.h>
 
-#define BUCKET_BITS 15U
+#define BUCKET_BITS 17U
 #define BUCKET_COUNT (1U << BUCKET_BITS)
 #define PAGE_MASK 4095UL
 
