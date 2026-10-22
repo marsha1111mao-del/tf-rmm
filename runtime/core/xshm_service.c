@@ -37,6 +37,6 @@ unsigned long xshm_service_call(const struct xshm_memory_ops *ops,
 	status = xshm_endpoint_call(owner, command, id, argument, output);
 	if (command == XSHM_REGISTER && status == XSHM_SUCCESS && ops != NULL)
 		output[2] |= XSHM_CAP_MEMORY | XSHM_CAP_MEMORY_IDENTITY |
-			     XSHM_CAP_EVENT_IRQ | XSHM_CAP_ACK_ARM;
+			     XSHM_CAP_EVENT_IRQ | XSHM_CAP_ACK_ARM | XSHM_CAP_NOTIFY_TIMING;
 	return status;
 }
