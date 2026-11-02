@@ -7,6 +7,7 @@
 #include <xshm_endpoint.h>
 #include <xshm_runtime.h>
 #include <arch.h>
+#include <arch_helpers.h>
 #include <buffer.h>
 #include <debug.h>
 #include <esr.h>
@@ -321,12 +322,28 @@ unsigned long smc_rec_enter(unsigned long rec_addr,
 
 	if (rec->rec_idx == 0UL) {
 		xshm_policy_lock();
+		xshm_endpoint_resident_enter(rec->realm_info.g_rd,
+			read_mpidr_el1() & XSHM_MPIDR_AFFINITY_MASK);
 		if (xshm_endpoint_irq_take(rec->realm_info.g_rd))
 			xshm_irq_inject(rec->sysregs.gicstate.ich_lr_el2,
 					gic_vgic_get_num_lrs() + 1U);
 		xshm_policy_unlock();
 	}
 	rec_run_loop(rec, &rec_run.exit);
+	if (rec->rec_idx == 0UL) {
+		bool idle = (rec_run.exit.exit_reason == RMI_EXIT_SYNC &&
+			(rec_run.exit.esr & MASK(ESR_EL2_EC)) == ESR_EL2_EC_WFX) ||
+			(rec_run.exit.exit_reason == RMI_EXIT_PSCI &&
+			 (rec_run.exit.gprs[0] == SMC32_PSCI_CPU_SUSPEND ||
+			  rec_run.exit.gprs[0] == SMC64_PSCI_CPU_SUSPEND));
+
+		xshm_policy_lock();
+		if (xshm_endpoint_resident_leave(rec->realm_info.g_rd, idle)) {
+			rec_run.exit.exit_reason = RMI_EXIT_IRQ;
+			rec_run.exit.esr = 0UL;
+		}
+		xshm_policy_unlock();
+	}
 
 	gic_copy_state_to_rec_exit(&rec->sysregs.gicstate, &rec_run.exit);
 

@@ -9,6 +9,7 @@
 #include <smc-rmi.h>
 #include <granule.h>
 #include <arch_helpers.h>
+#include <rmm_el3_ifc.h>
 
 _Static_assert(XSHM_SUCCESS == RSI_SUCCESS, "XSHM status ABI");
 _Static_assert(XSHM_ERROR_INPUT == RSI_ERROR_INPUT, "XSHM status ABI");
@@ -41,7 +42,9 @@ void handle_rsi_opencca_xshm(struct rec *rec, struct rmi_rec_exit *rec_exit,
 	}
 	/* No Host-supplied VMID or caller-supplied owner enters this decision. */
 	/* This platform's event IRQ is routed to REC0, not an arbitrary caller. */
-	if (rec->regs[1] == XSHM_IRQ_BIND && rec->rec_idx != 0UL) {
+	if ((command == XSHM_IRQ_BIND || command == XSHM_RESIDENT_BIND ||
+	     command == XSHM_FAST_IRQ_BIND) &&
+	    rec->rec_idx != 0UL) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;
 		return;
 	}
@@ -55,14 +58,36 @@ void handle_rsi_opencca_xshm(struct rec *rec, struct rmi_rec_exit *rec_exit,
 					 rec->regs[2], &peer_id);
 	status = xshm_service_call(&xshm_rtt_ops, rec->realm_info.g_rd,
 		command, rec->regs[2], rec->regs[3], rec->regs[4], output);
+	if (command == XSHM_RESIDENT_BIND && status == XSHM_SUCCESS)
+		xshm_endpoint_resident_enter(rec->realm_info.g_rd,
+			read_mpidr_el1() & XSHM_MPIDR_AFFINITY_MASK);
 	if (status == XSHM_SUCCESS && output[2] == 1UL &&
 	    peer != NULL && xshm_endpoint_irq_enabled(peer)) {
+		bool direct = false;
+
+#if ENABLE_OPENCCA
+		unsigned long mpidr;
+
+		if (command == XSHM_NOTIFY &&
+		    xshm_endpoint_resident_target(peer, &mpidr)) {
+			if (xshm_endpoint_fast_irq_enabled(peer))
+				direct = monitor_call(SMC_RMM_OPENCCA_XSHM_KICK,
+					mpidr, 1UL, 0UL, 0UL, 0UL, 0UL) == 0UL;
+			if (!direct)
+				direct = monitor_call(SMC_RMM_OPENCCA_XSHM_KICK,
+					mpidr, 0UL, 0UL, 0UL, 0UL, 0UL) == 0UL;
+		}
+#endif
+		if (command == XSHM_NOTIFY)
+			xshm_endpoint_wake_record(peer, direct);
 		/* Only a scheduler hint crosses to Host. The interrupt's pending
 		 * state and LR remain private, and are rechecked on REC entry.
 		 */
-		rec_exit->exit_reason = XSHM_RMI_EXIT_NOTIFY;
-		rec_exit->gprs[0] = granule_addr((struct granule *)peer);
-		res->action = UPDATE_REC_EXIT_TO_HOST;
+		if (!direct) {
+			rec_exit->exit_reason = XSHM_RMI_EXIT_NOTIFY;
+			rec_exit->gprs[0] = granule_addr((struct granule *)peer);
+			res->action = UPDATE_REC_EXIT_TO_HOST;
+		}
 	}
 	xshm_policy_unlock();
 	res->smc_res.x[0] = status;

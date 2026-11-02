@@ -1,0 +1,7 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/* Distinct model IDs; production firmware uses the real RMI header. */
+enum {
+	SMC_RMI_REALM_DESTROY, SMC_RMI_DATA_CREATE, SMC_RMI_DATA_CREATE_UNKNOWN,
+	SMC_RMI_DATA_DESTROY, SMC_RMI_RTT_FOLD, SMC_RMI_RTT_DESTROY,
+	SMC_RMI_RTT_INIT_RIPAS, SMC_RMI_RTT_SET_RIPAS
+};

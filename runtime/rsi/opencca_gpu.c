@@ -9,6 +9,7 @@
 #include <granule.h>
 #include <limits.h>
 #include <opencca_gpu_lease.h>
+#include <opencca_gpu_private.h>
 #include <opencca_iommu.h>
 #include <realm.h>
 #include <rsi-handler.h>
@@ -140,7 +141,7 @@ unsigned long smc_opencca_gpu_mmio_grant(unsigned long rd_addr)
 	if (g_rd == NULL)
 		return status;
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	if (opencca_gpu_mmio_grant(g_rd))
+	if (!gpu_private_raw_access_blocked() && opencca_gpu_mmio_grant(g_rd))
 		status = RMI_SUCCESS;
 	spinlock_release(&opencca_gpu_mappings_lock);
 	granule_unlock(g_rd);
@@ -167,13 +168,172 @@ static const struct opencca_gpu_ops gpu_ops = {
 	.opp_valid = plat_opencca_gpu_opp_valid
 };
 
+bool opencca_gpu_isolate_service(const void *service)
+{
+	bool accepted, already_isolated;
+
+	/* The RSI private adapter holds the same policy lock as RMI teardown.
+	 * Do not retain the mapping lock while clearing private PT references.
+	 */
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	already_isolated = opencca_gpu_service_isolated(service);
+	accepted = opencca_gpu_service_isolate(&gpu_ops, service);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	if (accepted && !already_isolated)
+		opencca_gpu_private_device_revoked();
+	return accepted;
+}
+
+bool opencca_gpu_private_pt_install(unsigned long root, unsigned int slot)
+{
+	bool installed;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	installed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_install(root, slot);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return installed;
+}
+
+bool opencca_gpu_private_pt_sync(unsigned long root)
+{
+	bool synchronized;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	synchronized = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_sync(root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return synchronized;
+}
+
+bool opencca_gpu_private_pt_prepare(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing)
+{
+	bool prepared;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	prepared = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_prepare(root, slot, firmware_root, existing);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return prepared;
+}
+
+bool opencca_gpu_private_pt_check_running(unsigned long root, unsigned int slot,
+		unsigned long firmware_root, struct gpu_firmware_config *config)
+{
+	bool checked;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	checked = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_check_running(root, slot, firmware_root, config);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return checked;
+}
+
+bool opencca_gpu_private_pt_extend(unsigned long root, unsigned int slot, unsigned long firmware_root)
+{
+	bool extended;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	extended = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_extend(root, slot, firmware_root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return extended;
+}
+
+bool opencca_gpu_private_pt_detach(unsigned long root, unsigned int slot,
+		unsigned long firmware_root, bool detached)
+{
+	bool stopped;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	stopped = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_detach(root, slot, firmware_root, detached);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return stopped;
+}
+
+bool opencca_gpu_firmware_install(unsigned long root)
+{
+	bool installed;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	installed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_firmware_install(root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return installed;
+}
+
+bool opencca_gpu_private_pt_flush_live(unsigned long root, unsigned int slot,
+		unsigned long firmware_root)
+{
+	bool flushed;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	flushed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_pt_flush_live(root, slot, firmware_root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return flushed;
+}
+
+bool opencca_gpu_firmware_boot(unsigned long root)
+{
+	bool booted;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	booted = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_firmware_boot(root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return booted;
+}
+
+bool opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firmware_config *config)
+{
+	bool configured;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	configured = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_firmware_configuration(root, config);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return configured;
+}
+
+bool opencca_gpu_firmware_notify(unsigned long root)
+{
+	bool notified;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	notified = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		plat_opencca_gpu_firmware_notify(root);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return notified;
+}
+
 void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
 		       unsigned long error, struct smc_result *res)
 {
-	bool accepted;
+	bool accepted, was_mediated;
 
 	memset(res, 0, sizeof(*res));
+	if (operation == OPENCCA_GPU_PRIVATE_RECLAIM) {
+		struct gpu_private_result result;
+
+		res->x[0] = RMI_ERROR_INPUT;
+		if (error != 0UL)
+			return;
+		/* This Host request cannot name a BO, PA or hardware root. The
+		 * adapter independently proves RD lifetime and trusted revocation.
+		 */
+		opencca_gpu_private_reclaim(argument, &result);
+		res->x[1] = opencca_gpu_state();
+		res->x[2] = result.status;
+		res->x[3] = result.value[0];
+		if (result.status == GPU_PRIVATE_SUCCESS ||
+		    result.status == GPU_PRIVATE_INCOMPLETE)
+			res->x[0] = RMI_SUCCESS;
+		return;
+	}
 	spinlock_acquire(&opencca_gpu_mappings_lock);
+	was_mediated = opencca_gpu_state() == OPENCCA_GPU_MEDIATED;
 	accepted = opencca_gpu_control(&gpu_ops, NULL, operation, argument, error);
 	res->x[0] = accepted ? RMI_SUCCESS : RMI_ERROR_INPUT;
 	res->x[1] = opencca_gpu_state();
@@ -183,6 +343,16 @@ void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
 		res->x[4] = OPENCCA_GPU_MMIO_SIZE;
 	}
 	spinlock_release(&opencca_gpu_mappings_lock);
+	/* RMI dispatch holds xshm_policy_lock. RELEASE success includes removal
+	 * of the service's MMIO alias followed by RMM-observed reset completion;
+	 * a Host-provided completion value or a raw-service RESET is insufficient.
+	 * A mediated RESET also qualifies: its raw MMIO was already revoked.
+	 * Retire stale firmware/context state before allowing the service to run
+	 * again; a successful hardware reset has removed all installed roots.
+	 */
+	if (accepted && (operation == OPENCCA_GPU_RELEASE ||
+		(was_mediated && operation == OPENCCA_GPU_RESET)))
+		opencca_gpu_private_device_revoked();
 }
 
 void handle_rsi_opencca_gpu_control(struct rec *rec, struct rsi_result *res)

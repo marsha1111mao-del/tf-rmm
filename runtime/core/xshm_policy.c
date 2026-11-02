@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <granule.h>
 #include <opencca_iommu.h>
+#include <opencca_gpu_private.h>
 #include <s2tt.h>
 #include <smc-rmi.h>
 #include <spinlock.h>
@@ -31,6 +32,7 @@ bool xshm_rmi_allowed(unsigned int fid, unsigned long arg0,
 	switch (fid) {
 	case SMC_RMI_REALM_DESTROY:
 		return !xshm_memory_owner_busy(owner) &&
+		       !gpu_private_owner_busy(owner) &&
 		       !opencca_iommu_owner_busy(owner);
 	case SMC_RMI_DATA_CREATE:
 	case SMC_RMI_DATA_CREATE_UNKNOWN:
@@ -63,5 +65,6 @@ bool xshm_rmi_allowed(unsigned int fid, unsigned long arg0,
 		return true;
 	}
 	return !xshm_memory_range_busy(owner, base, size) &&
+	       !gpu_private_range_busy(owner, base, size) &&
 	       !opencca_iommu_range_busy(owner, base, size);
 }

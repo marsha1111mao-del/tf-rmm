@@ -96,6 +96,9 @@ void handle_rsi_attest_token_continue(struct rec *rec,
 void handle_rsi_opencca_gpa_to_hpa(struct rec *rec, struct rsi_result *res);
 void handle_rsi_opencca_iommu(struct rec *rec, struct rsi_result *res);
 void handle_rsi_opencca_gpu_control(struct rec *rec, struct rsi_result *res);
+void handle_rsi_opencca_gpu_private(struct rec *rec, struct rsi_result *res);
+/* Called only after the RMM GPU RELEASE backend has stopped the device. */
+void opencca_gpu_private_device_revoked(void);
 void handle_rsi_opencca_gpu_revoke(struct rec *rec, struct rsi_result *res);
 void opencca_gpu_release_realm_mappings(struct granule *g_rd);
 bool opencca_gpu_pm_destroy_allowed(struct granule *g_rd);

@@ -13,7 +13,9 @@ unsigned long xshm_service_call(const struct xshm_memory_ops *ops,
 	for (unsigned int i = 0U; i < 4U; i++)
 		output[i] = 0UL;
 	if (command >= XSHM_MEM_OFFER && command != XSHM_IRQ_BIND &&
-	    command != XSHM_ACK_ARM) {
+	    command != XSHM_ACK_ARM && command != XSHM_RESIDENT_BIND &&
+	    command != XSHM_RESIDENT_STATS && command != XSHM_FAST_IRQ_BIND &&
+	    command != XSHM_FAST_IRQ_STATS) {
 		struct xshm_memory_identity caller = {
 			.owner = owner,
 			.endpoint = xshm_endpoint_id(owner),
@@ -37,6 +39,7 @@ unsigned long xshm_service_call(const struct xshm_memory_ops *ops,
 	status = xshm_endpoint_call(owner, command, id, argument, output);
 	if (command == XSHM_REGISTER && status == XSHM_SUCCESS && ops != NULL)
 		output[2] |= XSHM_CAP_MEMORY | XSHM_CAP_MEMORY_IDENTITY |
-			     XSHM_CAP_EVENT_IRQ | XSHM_CAP_ACK_ARM | XSHM_CAP_NOTIFY_TIMING;
+			     XSHM_CAP_EVENT_IRQ | XSHM_CAP_ACK_ARM | XSHM_CAP_NOTIFY_TIMING |
+			     XSHM_CAP_RESIDENT_WAKE | XSHM_CAP_FAST_IRQ;
 	return status;
 }

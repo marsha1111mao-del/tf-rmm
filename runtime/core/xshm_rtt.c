@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <buffer.h>
 #include <granule.h>
+#include <opencca_gpu_private.h>
 #include <realm.h>
 #include <s2tt.h>
 #include <xshm_runtime.h>
@@ -11,6 +12,9 @@ static bool valid_range(const void *owner, unsigned long ipa, unsigned long size
 	struct rd *rd;
 	bool valid;
 
+	/* GPU-only registration must not subsequently become CPU sharing. */
+	if (gpu_private_range_busy(owner, ipa, size))
+		return false;
 	granule_lock(g_rd, GRANULE_STATE_RD);
 	rd = buffer_granule_map(g_rd, SLOT_RD);
 	valid = size != 0UL && ipa + size > ipa &&
@@ -72,12 +76,40 @@ static bool page(const void *owner, unsigned long ipa, unsigned long *pa,
 				s2tt_invalidate_page(&ctx, ipa);
 				success = true;
 			}
-		} else if (s2tte_is_assigned_ram(&ctx, pte, S2TT_PAGE_LEVEL) &&
+		} else if (operation == 3U && s2tte_is_assigned_ram(&ctx, pte, S2TT_PAGE_LEVEL) &&
 			   s2tte_pa(&ctx, pte, S2TT_PAGE_LEVEL) == *pa) {
 			s2tte_write(&table[wi.index], s2tte_create_unassigned_ram(&ctx));
 			s2tt_invalidate_page(&ctx, ipa);
 			atomic_granule_put(wi.g_llt);
 			success = true;
+		} else if (((operation == 4U && s2tte_is_assigned_ram(&ctx, pte, S2TT_PAGE_LEVEL)) ||
+			    ((operation == 5U || operation == 6U) &&
+			     s2tte_is_assigned_empty(&ctx, pte, S2TT_PAGE_LEVEL))) &&
+			   s2tte_pa(&ctx, pte, S2TT_PAGE_LEVEL) == *pa) {
+			struct granule *data = find_lock_granule(*pa, GRANULE_STATE_DATA);
+
+			if (data != NULL) {
+				/* Retain assigned PA, DATA state and RTT reference count.
+				 * RMI mutation gates keep this entry unavailable to Host
+				 * RIPAS/fold/destroy until the private lifetime is retired.
+				 */
+				unsigned long entry = operation == 4U ?
+					s2tte_create_assigned_empty(&ctx, *pa, S2TT_PAGE_LEVEL) :
+					s2tte_create_assigned_ram(&ctx, *pa, S2TT_PAGE_LEVEL);
+
+				/* Stage-2 MemAttr=0101 forces Normal Non-cacheable with
+				 * or without FWB (also Linux MT_S2[_FWB]_NORMAL_NC).
+				 * Clear all FOUR bits: OpenCCA's default RAM uses 1111.
+				 * Callers have hidden/TLBI'd and flushed the old WB page;
+				 * never change a live valid leaf's memory attributes here.
+				 */
+				if (operation == 6U)
+					entry = (entry & ~(0xfUL << 2U)) | (0x5UL << 2U);
+				s2tte_write(&table[wi.index], entry);
+				s2tt_invalidate_page(&ctx, ipa);
+				granule_unlock(data);
+				success = true;
+			}
 		}
 	}
 	buffer_unmap(table);
@@ -114,3 +146,18 @@ const struct xshm_memory_ops xshm_rtt_ops = {
 	.install = install,
 	.restore = restore,
 };
+
+bool gpu_control_rtt_hide(const void *owner, unsigned long ipa, unsigned long pa)
+{
+	return page(owner, ipa, &pa, 4U);
+}
+
+bool gpu_control_rtt_restore(const void *owner, unsigned long ipa, unsigned long pa)
+{
+	return page(owner, ipa, &pa, 5U);
+}
+
+bool gpu_private_rtt_restore_uncached(const void *owner, unsigned long ipa, unsigned long pa)
+{
+	return page(owner, ipa, &pa, 6U);
+}

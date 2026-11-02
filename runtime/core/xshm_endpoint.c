@@ -9,6 +9,14 @@ struct xshm_endpoint {
 	unsigned long id;
 	bool irq_enabled;
 	bool irq_pending;
+	bool resident_enabled;
+	bool resident;
+	bool fast_irq_enabled;
+	unsigned long fast_irq_resumes;
+	unsigned long mpidr;
+	unsigned long direct_wakes;
+	unsigned long host_wakes;
+	unsigned long idle_rescues;
 };
 
 struct xshm_event {
@@ -111,6 +119,81 @@ static bool endpoint_exists(unsigned long id)
 	return false;
 }
 
+void xshm_endpoint_resident_enter(const void *owner, unsigned long mpidr)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+
+	if (endpoint != NULL && endpoint->resident_enabled) {
+		endpoint->mpidr = mpidr;
+		endpoint->resident = true;
+	}
+}
+
+bool xshm_endpoint_resident_target(const void *owner, unsigned long *mpidr)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+
+	if (endpoint == NULL || !endpoint->resident_enabled || !endpoint->resident ||
+	    !endpoint->irq_enabled || !endpoint->irq_pending || mpidr == NULL)
+		return false;
+	*mpidr = endpoint->mpidr;
+	return true;
+}
+
+bool xshm_endpoint_fast_irq_enabled(const void *owner)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+
+	return endpoint != NULL && endpoint->fast_irq_enabled;
+}
+
+bool xshm_endpoint_fast_irq_pending(const void *owner, unsigned long mpidr)
+{
+	unsigned long target;
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+
+	return endpoint != NULL && endpoint->fast_irq_enabled &&
+		xshm_endpoint_resident_target(owner, &target) && target == mpidr;
+}
+
+bool xshm_endpoint_fast_irq_take(const void *owner, unsigned long mpidr)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+
+	if (!xshm_endpoint_fast_irq_pending(owner, mpidr))
+		return false;
+	endpoint->irq_pending = false;
+	if (endpoint->fast_irq_resumes != ULONG_MAX)
+		endpoint->fast_irq_resumes++;
+	return true;
+}
+
+bool xshm_endpoint_resident_leave(const void *owner, bool idle)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+	bool rescue = endpoint != NULL && endpoint->resident_enabled && idle &&
+		endpoint->irq_enabled && endpoint->irq_pending;
+
+	if (endpoint != NULL) {
+		endpoint->resident = false;
+		if (rescue && endpoint->idle_rescues != ULONG_MAX)
+			endpoint->idle_rescues++;
+	}
+	return rescue;
+}
+
+void xshm_endpoint_wake_record(const void *owner, bool direct)
+{
+	struct xshm_endpoint *endpoint = owner == NULL ? NULL : endpoint_by_owner(owner);
+	unsigned long *counter;
+
+	if (endpoint == NULL || !endpoint->resident_enabled)
+		return;
+	counter = direct ? &endpoint->direct_wakes : &endpoint->host_wakes;
+	if (*counter != ULONG_MAX)
+		(*counter)++;
+}
+
 void xshm_endpoint_release(const void *owner)
 {
 	struct xshm_endpoint *endpoint;
@@ -203,7 +286,9 @@ unsigned long xshm_endpoint_call(const void *owner, unsigned long command,
 	for (unsigned int i = 0U; i < 4U; i++)
 		output[i] = 0UL;
 	if ((owner == NULL) || ((command > XSHM_UNREGISTER) &&
-	    (command != XSHM_IRQ_BIND) && (command != XSHM_ACK_ARM)) ||
+	    (command != XSHM_IRQ_BIND) && (command != XSHM_ACK_ARM) &&
+	    (command != XSHM_RESIDENT_BIND) && (command != XSHM_RESIDENT_STATS) &&
+	    (command != XSHM_FAST_IRQ_BIND) && (command != XSHM_FAST_IRQ_STATS)) ||
 	    (((command != XSHM_ARM) && (command != XSHM_ACK)) &&
 	     (sequence != 0UL)))
 		return XSHM_ERROR_INPUT;
@@ -212,6 +297,37 @@ unsigned long xshm_endpoint_call(const void *owner, unsigned long command,
 	endpoint = endpoint_by_owner(owner);
 	if (endpoint == NULL)
 		return XSHM_ERROR_STATE;
+	if (command == XSHM_RESIDENT_BIND) {
+		if (id > 1UL || !endpoint->irq_enabled)
+			return XSHM_ERROR_INPUT;
+		endpoint->resident_enabled = id == 1UL;
+		endpoint->resident = false;
+		if (id == 0UL)
+			endpoint->fast_irq_enabled = false;
+		return XSHM_SUCCESS;
+	}
+	if (command == XSHM_FAST_IRQ_BIND) {
+		if (id > 1UL || !endpoint->irq_enabled || !endpoint->resident_enabled)
+			return XSHM_ERROR_INPUT;
+		endpoint->fast_irq_enabled = id == 1UL;
+		return XSHM_SUCCESS;
+	}
+	if (command == XSHM_FAST_IRQ_STATS) {
+		if (id != 0UL)
+			return XSHM_ERROR_INPUT;
+		output[0] = endpoint->fast_irq_resumes;
+		output[1] = endpoint->fast_irq_enabled ? 1UL : 0UL;
+		return XSHM_SUCCESS;
+	}
+	if (command == XSHM_RESIDENT_STATS) {
+		if (id != 0UL)
+			return XSHM_ERROR_INPUT;
+		output[0] = endpoint->direct_wakes;
+		output[1] = endpoint->host_wakes;
+		output[2] = endpoint->idle_rescues;
+		output[3] = endpoint->resident_enabled ? 1UL : 0UL;
+		return XSHM_SUCCESS;
+	}
 	if (command == XSHM_IRQ_BIND) {
 		if (id != 0UL)
 			return XSHM_ERROR_INPUT;

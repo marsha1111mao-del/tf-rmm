@@ -84,7 +84,7 @@
 #define SMC64_RMI_FNUM_MAX	(U(0x16E))
 
 #define SMC64_RSI_FNUM_MIN	(U(0x190))
-#define SMC64_RSI_FNUM_MAX	(U(0x1B1))
+#define SMC64_RSI_FNUM_MAX	(U(0x1B2))
 
 #define SMC64_RMM_EL3_FNUM_MIN	(U(0x1B0))
 #define SMC64_RMM_EL3_FNUM_MAX	(U(0x1CF))

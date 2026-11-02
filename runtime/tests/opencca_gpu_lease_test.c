@@ -3,6 +3,7 @@
 #include <limits.h>
 #include <opencca_gpu_lease.h>
 #include <stdio.h>
+#include <string.h>
 
 static const unsigned char owner_a, owner_b;
 static bool reset_ok = true;
@@ -11,11 +12,18 @@ static unsigned int resets;
 static unsigned int revokes;
 static bool expect_revoke;
 static bool revoked;
+static bool isolating;
 
 static bool reset(bool preserve_irqs)
 {
 	if (expect_revoke)
 		assert(revoked && !preserve_irqs);
+	if (isolating) {
+		assert(!preserve_irqs);
+		assert(!opencca_gpu_mmio_allowed(&owner_a));
+		assert(!opencca_gpu_service_running(&owner_a));
+		assert(opencca_gpu_lease_active() == 1U);
+	}
 	resets++;
 	return reset_ok;
 }
@@ -23,6 +31,14 @@ static bool reset(bool preserve_irqs)
 static bool revoke(const void *owner)
 {
 	assert(owner != NULL);
+	if (isolating) {
+		assert(owner == &owner_a);
+		assert(!opencca_gpu_mmio_allowed(owner));
+		assert(!opencca_gpu_mmio_grant(owner));
+		assert(!opencca_gpu_claim(owner));
+		assert(!opencca_gpu_service_running(owner));
+		assert(opencca_gpu_lease_active() == 1U);
+	}
 	revokes++;
 	revoked = revoke_ok;
 	return revoke_ok;
@@ -42,11 +58,111 @@ static bool control(unsigned long op, unsigned long argument, unsigned long erro
 
 static unsigned long batch[OPENCCA_GPU_LEASE_BATCH];
 
-int main(void)
+static int service_isolation(void)
+{
+	unsigned long page = 0x80000000UL;
+	unsigned int old_resets, old_revokes;
+
+	assert(control(OPENCCA_GPU_POWER_ON, 0UL, 0UL));
+	assert(!opencca_gpu_service_isolate(&ops, NULL));
+	assert(!opencca_gpu_service_isolate(&ops, &owner_a));
+	assert(opencca_gpu_mmio_grant(&owner_a));
+	assert(!opencca_gpu_service_isolate(&ops, &owner_a)); /* not claimed */
+	assert(opencca_gpu_claim(&owner_a));
+	assert(opencca_gpu_service_running(&owner_a));
+	assert(!opencca_gpu_service_isolated(&owner_a));
+	assert(!opencca_gpu_service_running(&owner_b));
+	assert(!opencca_gpu_service_isolate(&ops, &owner_b));
+	assert(!opencca_gpu_service_isolate(NULL, &owner_a));
+	assert(opencca_gpu_lease_acquire(&owner_a, &page, 1U));
+	old_resets = resets;
+	old_revokes = revokes;
+	/* No reset or reclaim may precede a successful MMIO revocation. */
+	isolating = true;
+	revoke_ok = false;
+	assert(!opencca_gpu_service_isolate(&ops, &owner_a));
+	assert(resets == old_resets && revokes == old_revokes + 1U);
+	assert(opencca_gpu_state() == OPENCCA_GPU_QUARANTINED);
+	assert(opencca_gpu_lease_active() == 1U);
+	assert(!opencca_gpu_service_isolated(&owner_a));
+	assert(!opencca_gpu_mmio_allowed(&owner_a));
+	/* Host RESET cannot turn a failed handoff into a direct-access owner. */
+	isolating = false;
+	assert(control(OPENCCA_GPU_RESET, 0UL, 0UL));
+	assert(opencca_gpu_state() == OPENCCA_GPU_QUARANTINED);
+	assert(!opencca_gpu_claim(&owner_a));
+	assert(!opencca_gpu_mmio_grant(&owner_a));
+	assert(!opencca_gpu_service_running(&owner_a));
+	assert(opencca_gpu_lease_active() == 1U);
+
+	isolating = true;
+	revoke_ok = true;
+	reset_ok = false;
+	expect_revoke = true;
+	assert(!opencca_gpu_service_isolate(&ops, &owner_a));
+	assert(opencca_gpu_state() == OPENCCA_GPU_QUARANTINED);
+	assert(opencca_gpu_lease_page_busy(page));
+	assert(!opencca_gpu_service_running(&owner_a));
+	reset_ok = true;
+	assert(opencca_gpu_service_isolate(&ops, &owner_a));
+	isolating = false;
+	expect_revoke = false;
+	assert(opencca_gpu_state() == OPENCCA_GPU_MEDIATED);
+	assert(opencca_gpu_service_running(&owner_a));
+	assert(opencca_gpu_service_isolated(&owner_a));
+	assert(!opencca_gpu_mmio_running(&owner_a));
+	assert(!opencca_gpu_mmio_allowed(&owner_a));
+	assert(!opencca_gpu_claim(&owner_a));
+	assert(!opencca_gpu_mmio_grant(&owner_a));
+	assert(!opencca_gpu_mapping_allowed(&owner_a, 0x80fb000000UL,
+		0xfb000000UL, 0x200000UL, 0x8000000000UL));
+	assert(!opencca_gpu_mapping_allowed(&owner_b, 0x80fb000000UL,
+		0xfb000000UL, 0x200000UL, 0x8000000000UL));
+	assert(!opencca_gpu_mapping_allowed(&owner_a, 0x80fb001000UL,
+		0xfb001000UL, 4096UL, 0x8000000000UL));
+	assert(!opencca_gpu_lease_acquire(&owner_a, &page, 1U));
+	assert(opencca_gpu_lease_active() == 0U);
+	assert(!opencca_gpu_lease_page_busy(page));
+	assert(opencca_gpu_pm_destroy_blocked(&owner_a));
+	old_resets = resets;
+	old_revokes = revokes;
+	assert(opencca_gpu_service_isolate(&ops, &owner_a));
+	assert(!opencca_gpu_service_isolate(&ops, &owner_b));
+	assert(resets == old_resets && revokes == old_revokes);
+	assert(!opencca_gpu_control(&ops, &owner_a, OPENCCA_GPU_RESET, 0UL, 0UL));
+	assert(!control(OPENCCA_GPU_OPP_BEGIN, 600000000UL, 0UL));
+	assert(control(OPENCCA_GPU_RESET, 0UL, 0UL));
+	assert(opencca_gpu_service_isolated(&owner_a));
+	assert(!opencca_gpu_claim(&owner_a));
+	assert(control(OPENCCA_GPU_RELEASE, 0UL, 0UL));
+	assert(!opencca_gpu_service_running(&owner_a));
+	assert(!opencca_gpu_service_isolated(&owner_a));
+	assert(control(OPENCCA_GPU_RESET, 0UL, 0UL));
+	assert(!opencca_gpu_claim(&owner_a));
+	assert(!opencca_gpu_mmio_grant(&owner_a));
+	assert(opencca_gpu_pm_destroy_begin(&owner_a));
+	opencca_gpu_mmio_release(&owner_a);
+	/* Only a complete owner teardown permits a new, independent raw owner. */
+	assert(opencca_gpu_mmio_grant(&owner_b));
+	assert(opencca_gpu_claim(&owner_b));
+	assert(!opencca_gpu_service_isolated(&owner_b));
+	assert(control(OPENCCA_GPU_RELEASE, 0UL, 0UL));
+	assert(opencca_gpu_pm_destroy_begin(&owner_b));
+	opencca_gpu_mmio_release(&owner_b);
+	assert(control(OPENCCA_GPU_POWER_OFF, 0UL, 0UL));
+	puts("GPU_SERVICE_ISOLATION=PASS actual owner, revoke-before-reset, sticky failures, retained/released DMA refs, service identity without MMIO, no regrant/claim, idempotence and teardown");
+	return 0;
+}
+
+int main(int argc, char **argv)
 {
 	unsigned long page = 0x80000000UL;
 	unsigned long other = page + 4096UL;
 	unsigned long mixed[] = { page, other };
+
+	if (argc == 2 && strcmp(argv[1], "--service-isolation") == 0)
+		return service_isolation();
+	assert(argc == 1);
 
 	assert(!control(OPENCCA_GPU_RESET, 0UL, 0UL));
 	assert(control(OPENCCA_GPU_POWER_ON, 0UL, 0UL));

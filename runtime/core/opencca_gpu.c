@@ -8,6 +8,10 @@ static const void *owner;
 static enum opencca_gpu_state state = OPENCCA_GPU_OFF;
 static enum opencca_gpu_state resume_state;
 static unsigned long pending_frequency;
+/* Sticky even on a failed handoff: a normal reset/claim must not restore
+ * authority after only part of the MMIO revocation has completed.
+ */
+static bool mediated;
 
 bool opencca_gpu_mmio_grant(const void *candidate)
 {
@@ -24,12 +28,55 @@ bool opencca_gpu_mmio_grant(const void *candidate)
 bool opencca_gpu_mmio_allowed(const void *candidate)
 {
 	return candidate != NULL && candidate == owner &&
+	       !mediated &&
 	       (state == OPENCCA_GPU_DESIGNATED || state == OPENCCA_GPU_RUNNING);
 }
 
 bool opencca_gpu_mmio_running(const void *candidate)
 {
-	return candidate != NULL && candidate == owner && state == OPENCCA_GPU_RUNNING;
+	return candidate != NULL && candidate == owner && !mediated &&
+	       state == OPENCCA_GPU_RUNNING;
+}
+
+bool opencca_gpu_service_running(const void *candidate)
+{
+	return candidate != NULL && candidate == owner &&
+	       (state == OPENCCA_GPU_RUNNING || state == OPENCCA_GPU_MEDIATED);
+}
+
+bool opencca_gpu_service_isolated(const void *candidate)
+{
+	return candidate != NULL && candidate == owner && mediated &&
+	       state == OPENCCA_GPU_MEDIATED;
+}
+
+bool opencca_gpu_service_isolate(const struct opencca_gpu_ops *ops,
+		const void *candidate)
+{
+	if (candidate == NULL || candidate != owner || ops == NULL ||
+	    ops->revoke_mmio == NULL || ops->reset == NULL)
+		return false;
+	if (opencca_gpu_service_isolated(candidate))
+		return true;
+	if (state != OPENCCA_GPU_RUNNING &&
+	    !(mediated && state == OPENCCA_GPU_QUARANTINED))
+		return false;
+
+	/* Revoke before reset and before releasing any old DMA references. Both
+	 * the new-mapping policy and claim path fail closed during the callbacks.
+	 */
+	mediated = true;
+	state = OPENCCA_GPU_QUARANTINED;
+	if (!ops->revoke_mmio(owner))
+		return false;
+	state = OPENCCA_GPU_RESETTING;
+	if (!ops->reset(false)) {
+		state = OPENCCA_GPU_QUARANTINED;
+		return false;
+	}
+	(void)opencca_gpu_lease_release_owner(owner);
+	state = OPENCCA_GPU_MEDIATED;
+	return true;
 }
 
 bool opencca_gpu_mapping_allowed(const void *candidate, unsigned long ipa,
@@ -71,7 +118,7 @@ static bool reset(const struct opencca_gpu_ops *ops, bool preserve_irqs)
 		return false;
 	}
 	/* A quarantined owner must claim again after successful recovery. */
-	state = previous == OPENCCA_GPU_QUARANTINED ?
+	state = previous == OPENCCA_GPU_QUARANTINED && !mediated ?
 		(owner == NULL ? OPENCCA_GPU_UNOWNED : OPENCCA_GPU_DESIGNATED) : previous;
 	return true;
 }
@@ -158,6 +205,7 @@ void opencca_gpu_mmio_release(const void *candidate)
 	if (candidate != owner || state != OPENCCA_GPU_DESTROYING)
 		return;
 	owner = NULL;
+	mediated = false;
 	state = OPENCCA_GPU_UNOWNED;
 }
 

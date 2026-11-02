@@ -338,3 +338,59 @@ unsigned int gic_vgic_get_num_lrs(void)
 {
 	return gic_virt_feature.nr_lrs;
 }
+
+#define PRIVATE_LR_CASE(slot) \
+	case slot: return read_ich_lr##slot##_el2();
+
+unsigned long gic_read_private_lr(void)
+{
+	switch (gic_virt_feature.nr_lrs) {
+	PRIVATE_LR_CASE(0)
+	PRIVATE_LR_CASE(1)
+	PRIVATE_LR_CASE(2)
+	PRIVATE_LR_CASE(3)
+	PRIVATE_LR_CASE(4)
+	PRIVATE_LR_CASE(5)
+	PRIVATE_LR_CASE(6)
+	PRIVATE_LR_CASE(7)
+	PRIVATE_LR_CASE(8)
+	PRIVATE_LR_CASE(9)
+	PRIVATE_LR_CASE(10)
+	PRIVATE_LR_CASE(11)
+	PRIVATE_LR_CASE(12)
+	PRIVATE_LR_CASE(13)
+	PRIVATE_LR_CASE(14)
+	PRIVATE_LR_CASE(15)
+	default: assert(false); return 0UL;
+	}
+}
+
+#undef PRIVATE_LR_CASE
+#define PRIVATE_LR_CASE(slot) \
+	case slot: write_ich_lr##slot##_el2(value); break;
+
+void gic_write_private_lr(unsigned long value)
+{
+	switch (gic_virt_feature.nr_lrs) {
+	PRIVATE_LR_CASE(0)
+	PRIVATE_LR_CASE(1)
+	PRIVATE_LR_CASE(2)
+	PRIVATE_LR_CASE(3)
+	PRIVATE_LR_CASE(4)
+	PRIVATE_LR_CASE(5)
+	PRIVATE_LR_CASE(6)
+	PRIVATE_LR_CASE(7)
+	PRIVATE_LR_CASE(8)
+	PRIVATE_LR_CASE(9)
+	PRIVATE_LR_CASE(10)
+	PRIVATE_LR_CASE(11)
+	PRIVATE_LR_CASE(12)
+	PRIVATE_LR_CASE(13)
+	PRIVATE_LR_CASE(14)
+	PRIVATE_LR_CASE(15)
+	default: assert(false); break;
+	}
+	isb();
+}
+
+#undef PRIVATE_LR_CASE

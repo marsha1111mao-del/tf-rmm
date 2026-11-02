@@ -21,9 +21,16 @@
 #define XSHM_IRQ_BIND 16UL
 #define XSHM_ACK_ARM 17UL
 #define XSHM_NOTIFY_TIMED 18UL
+#define XSHM_RESIDENT_BIND 19UL
+#define XSHM_RESIDENT_STATS 20UL
+#define XSHM_FAST_IRQ_BIND 21UL
+#define XSHM_FAST_IRQ_STATS 22UL
 #define XSHM_CAP_EVENT_IRQ 16UL
 #define XSHM_CAP_ACK_ARM 32UL
 #define XSHM_CAP_NOTIFY_TIMING 64UL
+#define XSHM_CAP_RESIDENT_WAKE 128UL
+#define XSHM_CAP_FAST_IRQ 256UL
+#define XSHM_MPIDR_AFFINITY_MASK 0xff00ffffffUL
 
 #define XSHM_SUCCESS 0UL
 #define XSHM_ERROR_INPUT 1UL
@@ -50,5 +57,12 @@ const void *xshm_endpoint_peer(const void *owner, unsigned long channel,
 void xshm_endpoint_release(const void *owner);
 bool xshm_endpoint_irq_enabled(const void *owner);
 bool xshm_endpoint_irq_take(const void *owner);
+void xshm_endpoint_resident_enter(const void *owner, unsigned long mpidr);
+bool xshm_endpoint_resident_target(const void *owner, unsigned long *mpidr);
+bool xshm_endpoint_resident_leave(const void *owner, bool idle);
+void xshm_endpoint_wake_record(const void *owner, bool direct);
+bool xshm_endpoint_fast_irq_enabled(const void *owner);
+bool xshm_endpoint_fast_irq_pending(const void *owner, unsigned long mpidr);
+bool xshm_endpoint_fast_irq_take(const void *owner, unsigned long mpidr);
 
 #endif

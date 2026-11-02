@@ -263,5 +263,6 @@ struct rsi_host_call {
  */
 #define SMC_RSI_OPENCCA_IOMMU		SMC64_RSI_FID(U(0x20))
 #define SMC_RSI_OPENCCA_GPU_CONTROL	SMC64_RSI_FID(U(0x21))
+#define SMC_RSI_OPENCCA_GPU_PRIVATE	SMC64_RSI_FID(U(0x22))
 
 #endif /* SMC_RSI_H */

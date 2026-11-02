@@ -27,6 +27,13 @@ CHECK_COMMAND(MEM_CONTINUE);
 CHECK_COMMAND(MEM_DESCRIBE);
 CHECK_COMMAND(IRQ_BIND);
 CHECK_COMMAND(ACK_ARM);
+CHECK_COMMAND(NOTIFY_TIMED);
+CHECK_COMMAND(RESIDENT_BIND);
+CHECK_COMMAND(RESIDENT_STATS);
+CHECK_COMMAND(FAST_IRQ_BIND);
+CHECK_COMMAND(FAST_IRQ_STATS);
+_Static_assert(XSHM_CAP_FAST_IRQ == REALM_XSHM_CAP_FAST_IRQ, "fast IRQ ABI");
+_Static_assert(XSHM_CAP_RESIDENT_WAKE == REALM_XSHM_CAP_RESIDENT_WAKE, "resident ABI");
 _Static_assert(XSHM_MEMORY_ACTIVE == REALM_XSHM_MEMORY_ACTIVE, "active state ABI");
 _Static_assert(sizeof(struct realm_xshm_pool) == 48U, "pool ioctl ABI");
 _Static_assert(sizeof(struct realm_xshm_call) == 72U, "Guest ioctl ABI");
@@ -38,6 +45,135 @@ static unsigned long call(unsigned int owner, unsigned long command,
 			  unsigned long id, unsigned long sequence)
 {
 	return xshm_endpoint_call(&owners[owner], command, id, sequence, output);
+}
+
+static void test_resident_request_wake(void)
+{
+	unsigned long channel, mpidr;
+
+	assert(call(0U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_OFFER, output[1], 0UL) == XSHM_SUCCESS);
+	channel = output[0];
+	assert(call(1U, XSHM_ACCEPT, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_RESIDENT_BIND, 1UL, 0UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	xshm_endpoint_resident_enter(&owners[1], 0x100UL);
+	assert(!xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(call(1U, XSHM_RESIDENT_BIND, 2UL, 0UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_RESIDENT_BIND, 1UL, 1UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_RESIDENT_BIND, 1UL, 0UL) == XSHM_SUCCESS);
+	xshm_endpoint_resident_enter(&owners[1], 0x100UL);
+	assert(!xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(mpidr == 0x100UL);
+	assert(!xshm_endpoint_resident_target(&owners[1], NULL));
+	xshm_endpoint_wake_record(&owners[1], true);
+	assert(xshm_endpoint_resident_leave(&owners[1], true));
+	assert(!xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(xshm_endpoint_irq_take(&owners[1]));
+	assert(!xshm_endpoint_irq_take(&owners[1]));
+	xshm_endpoint_resident_enter(&owners[1], 0x200UL);
+	assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_resident_leave(&owners[1], true));
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_resident_target(&owners[1], &mpidr));
+	xshm_endpoint_wake_record(&owners[1], false);
+	xshm_endpoint_resident_enter(&owners[1], 0x200UL);
+	assert(xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(mpidr == 0x200UL);
+	assert(!xshm_endpoint_resident_leave(&owners[1], false));
+	assert(xshm_endpoint_irq_take(&owners[1]));
+	assert(call(1U, XSHM_RESIDENT_STATS, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(output[0] == 1UL && output[1] == 1UL && output[2] == 1UL && output[3] == 1UL);
+	assert(call(0U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	xshm_endpoint_resident_enter(&owners[0], 0x300UL);
+	assert(call(1U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_resident_target(&owners[0], &mpidr));
+	assert(!xshm_endpoint_resident_leave(&owners[0], true));
+	assert(xshm_endpoint_irq_take(&owners[0]));
+	assert(call(1U, XSHM_RESIDENT_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	xshm_endpoint_resident_enter(&owners[1], 0x400UL);
+	assert(!xshm_endpoint_resident_target(&owners[1], &mpidr));
+	assert(call(1U, XSHM_RESIDENT_STATS, 1UL, 0UL) == XSHM_ERROR_INPUT);
+	xshm_endpoint_release(&owners[1]);
+	assert(!xshm_endpoint_resident_leave(&owners[1], true));
+	assert(call(1U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_RESIDENT_STATS, 0UL, 0UL) == XSHM_SUCCESS);
+	assert((output[0] | output[1] | output[2] | output[3]) == 0UL);
+	assert(!xshm_endpoint_resident_leave(NULL, true));
+	xshm_endpoint_release(&owners[0]);
+	xshm_endpoint_release(&owners[1]);
+	puts("XSHM_RESIDENT_REQUEST_WAKE_TEST=PASS");
+}
+
+static void test_fast_irq(void)
+{
+	unsigned long channel;
+
+	assert(call(0U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_OFFER, output[1], 0UL) == XSHM_SUCCESS);
+	channel = output[0];
+	assert(call(1U, XSHM_ACCEPT, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 1UL, 0UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 1UL, 0UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_RESIDENT_BIND, 1UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 2UL, 0UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 1UL, 1UL) == XSHM_ERROR_INPUT);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 1UL, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_fast_irq_enabled(NULL));
+	assert(!xshm_endpoint_fast_irq_enabled(&owners[0]));
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+	xshm_endpoint_resident_enter(&owners[1], 0x100UL);
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+	for (unsigned int iteration = 0U; iteration < 10000U; iteration++) {
+		assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+		assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+		assert(!xshm_endpoint_fast_irq_take(&owners[0], 0x100UL));
+		assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x200UL));
+		assert(!xshm_endpoint_fast_irq_pending(&owners[0], 0x100UL));
+		assert(!xshm_endpoint_fast_irq_pending(&owners[1], 0x200UL));
+		assert(xshm_endpoint_fast_irq_pending(&owners[1], 0x100UL));
+		assert(xshm_endpoint_fast_irq_pending(&owners[1], 0x100UL));
+		assert(xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+		assert(!xshm_endpoint_fast_irq_pending(&owners[1], 0x100UL));
+		assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+		assert(!xshm_endpoint_irq_take(&owners[1]));
+		assert(call(1U, XSHM_QUERY, channel, 0UL) == XSHM_SUCCESS);
+		assert(output[0] == iteration + 1UL && output[1] == iteration);
+	}
+	assert(call(1U, XSHM_FAST_IRQ_STATS, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(output[0] == 10000UL && output[1] == 1UL);
+	assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+	assert(call(1U, XSHM_FAST_IRQ_BIND, 1UL, 0UL) == XSHM_SUCCESS);
+	assert(xshm_endpoint_resident_leave(&owners[1], true));
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+	xshm_endpoint_resident_enter(&owners[1], 0x200UL);
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x100UL));
+	assert(xshm_endpoint_fast_irq_take(&owners[1], 0x200UL));
+	assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_RESIDENT_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(!xshm_endpoint_fast_irq_enabled(&owners[1]));
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x200UL));
+	assert(xshm_endpoint_irq_take(&owners[1]));
+	assert(call(1U, XSHM_FAST_IRQ_STATS, 1UL, 0UL) == XSHM_ERROR_INPUT);
+	xshm_endpoint_release(&owners[1]);
+	assert(!xshm_endpoint_fast_irq_take(&owners[1], 0x200UL));
+	assert(call(1U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_FAST_IRQ_STATS, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(output[0] == 0UL && output[1] == 0UL);
+	xshm_endpoint_release(&owners[0]);
+	xshm_endpoint_release(&owners[1]);
+	puts("XSHM_FAST_IRQ_POLICY_TEST=PASS");
 }
 
 int main(void)
@@ -157,6 +293,8 @@ int main(void)
 		xshm_endpoint_release(&owners[i]);
 	assert(call(0U, XSHM_QUERY, channel, 0UL) == XSHM_ERROR_STATE);
 	assert(xshm_endpoint_call(NULL, XSHM_REGISTER, 0UL, 0UL, output) == XSHM_ERROR_INPUT);
+	test_resident_request_wake();
+	test_fast_irq();
 	puts("XSHM_ENDPOINT_POLICY_TEST=PASS");
 	return 0;
 }

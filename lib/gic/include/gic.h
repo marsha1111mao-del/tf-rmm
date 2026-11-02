@@ -219,5 +219,7 @@ void gic_copy_state_to_rec_exit(struct gic_cpu_state *gicstate,
 bool gic_validate_state(struct rmi_rec_enter *rec_enter);
 void gic_restore_state(struct gic_cpu_state *gicstate);
 void gic_save_state(struct gic_cpu_state *gicstate);
+unsigned long gic_read_private_lr(void);
+void gic_write_private_lr(unsigned long value);
 
 #endif /* GIC_H */

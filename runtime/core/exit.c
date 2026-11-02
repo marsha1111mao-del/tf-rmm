@@ -23,6 +23,10 @@
 #include <smc-rsi.h>
 #include <status.h>
 #include <sysreg_traps.h>
+#include <xshm_runtime.h>
+#include <xshm_endpoint.h>
+#include <xshm_irq.h>
+#include <rmm_el3_ifc.h>
 
 static void system_abort(void)
 {
@@ -460,6 +464,9 @@ static bool handle_realm_rsi(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	case SMC_RSI_OPENCCA_GPU_CONTROL:
 		handle_rsi_opencca_gpu_control(rec, &res);
 		break;
+	case SMC_RSI_OPENCCA_GPU_PRIVATE:
+		handle_rsi_opencca_gpu_private(rec, &res);
+		break;
 	default:
 		res.action = UPDATE_REC_RETURN_TO_REALM;
 		res.smc_res.x[0] = SMC_UNKNOWN;
@@ -600,6 +607,28 @@ static bool handle_exception_serror_lel(struct rec *rec, struct rmi_rec_exit *re
 static bool handle_exception_irq_lel(struct rec *rec, struct rmi_rec_exit *rec_exit)
 {
 	(void)rec;
+
+#if ENABLE_OPENCCA
+	if (rec->rec_idx == 0UL) {
+		bool resume = false;
+		unsigned long mpidr = read_mpidr_el1() & XSHM_MPIDR_AFFINITY_MASK;
+
+		xshm_policy_lock();
+		if (xshm_endpoint_fast_irq_pending(rec->realm_info.g_rd, mpidr) &&
+		    monitor_call(SMC_RMM_OPENCCA_XSHM_TAKE,
+			0UL, 0UL, 0UL, 0UL, 0UL, 0UL) == 1UL &&
+		    xshm_endpoint_fast_irq_take(rec->realm_info.g_rd, mpidr)) {
+			unsigned long lr = gic_read_private_lr();
+
+			xshm_irq_inject(&lr, 1U);
+			gic_write_private_lr(lr);
+			resume = true;
+		}
+		xshm_policy_unlock();
+		if (resume)
+			return true;
+	}
+#endif
 
 	rec_exit->exit_reason = RMI_EXIT_IRQ;
 
