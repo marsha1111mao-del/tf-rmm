@@ -9,8 +9,12 @@ target_link_libraries(rmm-plat-host_build
     PRIVATE rmm-lib
             rmm-host-common)
 
+target_include_directories(rmm-plat-host_build
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime/include")
+
 target_sources(rmm-plat-host_build
     PRIVATE "src/host_setup.c"
-            "src/host_harness.c")
+            "src/host_harness.c"
+            "src/host_opencca_stubs.c")
 
 add_library(rmm-platform ALIAS rmm-plat-host_build)

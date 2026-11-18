@@ -8,6 +8,7 @@
 #define BO_PREFIX 0xcca2000000000000UL
 #define CTX_PREFIX 0xcca3000000000000UL
 #define MAP_PREFIX 0xcca4000000000000UL
+#define TX_PREFIX 0xcca5000000000000UL
 #define ADDRESS_MASK 0x0000fffffffff000UL
 #define ADDRESS_LIMIT (1UL << 48U)
 #define PAGE_MASK 4095UL
@@ -29,8 +30,10 @@
  * this index under the policy lock; no Client or service supplies its bits.
  */
 #define CACHE_LEASE_GROUPS 16U
-#define CACHE_LEASE_GROUP_SIZE ((GPU_PRIVATE_OBJECTS + CACHE_LEASE_GROUPS - 1U) / CACHE_LEASE_GROUPS)
-_Static_assert(GPU_PRIVATE_OBJECTS > 0U, "private object table must not be empty");
+#define CACHE_LEASE_GROUP_SIZE \
+	((GPU_PRIVATE_OBJECTS + CACHE_LEASE_GROUPS - 1U) / CACHE_LEASE_GROUPS)
+_Static_assert(GPU_PRIVATE_OBJECTS > 0U,
+	       "private object table must not be empty");
 
 struct backing_page {
 	/* RK GPU PA policy is at most 40 bits. Page-number encoding retains
@@ -45,7 +48,7 @@ struct private_bo {
 	const void *service;
 	unsigned long handle;
 	unsigned long access;
-	unsigned long min_ipa, max_ipa;
+	uint32_t min_ipa_page, max_ipa_page;
 	unsigned int pages, registered, mapped, pending;
 	unsigned short blocks[GPU_PRIVATE_BO_BLOCKS];
 	bool closing;
@@ -59,6 +62,8 @@ struct private_bo {
 	bool uncached;
 	unsigned int hidden;
 	unsigned int control_gpu_refs;
+	/* Reuse the alignment gap before cache_context. */
+	uint16_t map_context, mapping_cache;
 	unsigned long cache_context;
 };
 
@@ -67,6 +72,8 @@ struct private_context {
 	const void *service;
 	unsigned long handle;
 	unsigned long mapping_epoch;
+	bool map_transaction_active;
+	bool direct_mapping;
 	unsigned int root;
 	unsigned int mapped;
 	unsigned int pending;
@@ -90,6 +97,18 @@ struct private_context {
 
 static struct private_bo objects[GPU_PRIVATE_OBJECTS];
 static struct private_context contexts[GPU_PRIVATE_CONTEXTS];
+
+struct private_map_transaction {
+	unsigned long handle, context, sequence, cursor, version;
+	struct gpu_private_map_request request;
+	unsigned int phase, reservations;
+	bool mutated;
+	/* Two existing backing blocks hold retired counts and table-link history.
+	 * They are tagged with this transaction, never exposed as BO pages. */
+	unsigned short journal[2];
+	struct gpu_private_result last;
+};
+static struct private_map_transaction map_transactions[GPU_PRIVATE_CONTEXTS];
 /* Validated mapping set, not a completion/cache-coherence proof. Generation
  * prevents reuse when a context slot is recycled; the nonwrapping epoch
  * invalidates before every leaf edit, including control/heap mappings and
@@ -144,6 +163,14 @@ static struct private_cache_set *cache_set_for(unsigned long context)
 }
 static struct backing_page backing[GPU_PRIVATE_BLOCKS][ENTRIES];
 static unsigned long backing_owner[GPU_PRIVATE_BLOCKS];
+/* Conservative IPA bounds for each owned backing block. Only successful
+ * append publication widens them; partial release may leave wider bounds.
+ * They reject disjoint queries, never authorize reuse of a matching page.
+ */
+static uint32_t backing_min_ipa[GPU_PRIVATE_BLOCKS];
+static uint32_t backing_max_ipa[GPU_PRIVATE_BLOCKS];
+/* Indices into backing blocks, sorted by IPA among registered entries. */
+static uint16_t backing_order[GPU_PRIVATE_BLOCKS][ENTRIES];
 static uint64_t tables[GPU_PRIVATE_TABLES][ENTRIES]
 	__attribute__((aligned(4096)));
 /* A leaf's object tag is RMM-private and never inferred from an untrusted PTE. */
@@ -158,7 +185,8 @@ static unsigned long table_owner[GPU_PRIVATE_TABLES];
 static unsigned long slot_owner[GPU_PRIVATE_AS_SLOTS];
 static unsigned long next_id;
 
-static void cache_lease_acquire(struct private_context *ctx, struct private_bo *bo)
+static void cache_lease_acquire(struct private_context *ctx,
+				struct private_bo *bo)
 {
 	unsigned int index = (unsigned int)(bo - objects);
 
@@ -188,7 +216,19 @@ _Static_assert(GPU_PRIVATE_OBJECTS < USHRT_MAX, "object tags must fit");
 _Static_assert(sizeof(unsigned short) == 2U, "four tags must occupy one word");
 _Static_assert(GPU_PRIVATE_BLOCKS < USHRT_MAX, "backing indices must fit");
 _Static_assert(sizeof(tables[0]) == GPU_PRIVATE_PAGE_SIZE, "hardware PT size");
-_Static_assert(GPU_PRIVATE_BO_BLOCKS * ENTRIES < NC_PENDING, "NC prefix encoding");
+_Static_assert(GPU_PRIVATE_BO_BLOCKS *ENTRIES < NC_PENDING,
+	       "NC prefix encoding");
+_Static_assert(GPU_PRIVATE_OBJECTS <= 2U * ENTRIES,
+	       "transaction count journal capacity");
+/* A contiguous range of at most GPU_PRIVATE_BO_BLOCKS * 512 pages needs
+ * at most BO_BLOCKS + 1 leaf tables, two L2 and two L1 tables, even across
+ * a 512 GiB boundary. The root already exists. Journal capacity bounds a
+ * transaction, not the global pool shared by all Clients.
+ */
+_Static_assert(GPU_PRIVATE_BO_BLOCKS <= ENTRIES - 5U,
+	       "transaction table journal capacity");
+_Static_assert(GPU_PRIVATE_TABLES < USHRT_MAX,
+	       "table journal indices must fit");
 
 static void result_init(struct gpu_private_result *result)
 {
@@ -215,7 +255,8 @@ static struct private_bo *bo_lookup(const void *owner, unsigned long handle)
 	return bo->handle == handle && bo->owner == owner ? bo : NULL;
 }
 
-static struct private_context *ctx_lookup(const void *owner, unsigned long handle)
+static struct private_context *ctx_lookup(const void *owner,
+					  unsigned long handle)
 {
 	unsigned long slot = handle & 0xffffUL;
 	struct private_context *ctx;
@@ -226,7 +267,8 @@ static struct private_context *ctx_lookup(const void *owner, unsigned long handl
 	return ctx->handle == handle && ctx->owner == owner ? ctx : NULL;
 }
 
-static struct private_map_grant *grant_lookup(const void *owner, unsigned long handle)
+static struct private_map_grant *grant_lookup(const void *owner,
+					      unsigned long handle)
 {
 	unsigned long slot = handle & 0xffffUL;
 	struct private_map_grant *grant;
@@ -242,7 +284,8 @@ static void grant_forget(struct private_map_grant *grant)
 	struct private_bo *bo = bo_lookup(grant->owner, grant->object);
 	struct private_context *ctx = ctx_lookup(grant->owner, grant->context);
 
-	assert(bo != NULL && ctx != NULL && bo->pending != 0U && ctx->pending != 0U);
+	assert(bo != NULL && ctx != NULL && bo->pending != 0U &&
+	       ctx->pending != 0U);
 	bo->pending--;
 	ctx->pending--;
 	memset(grant, 0, sizeof(*grant));
@@ -263,8 +306,8 @@ static struct backing_page *bo_page(struct private_bo *bo, unsigned int index)
 }
 
 static void bo_create(const void *owner, const void *service,
-		unsigned long size, unsigned long access, bool control,
-		struct gpu_private_result *result)
+		      unsigned long size, unsigned long access, bool control,
+		      struct gpu_private_result *result)
 {
 	result_init(result);
 	if (owner == NULL || service == NULL || (owner == service) != control ||
@@ -283,8 +326,10 @@ static void bo_create(const void *owner, const void *service,
 				pages += objects[i].pages;
 			}
 		}
-		if (count >= GPU_PRIVATE_CONTROL_OBJECTS || pages > GPU_PRIVATE_CONTROL_PAGES ||
-		    size / GPU_PRIVATE_PAGE_SIZE > GPU_PRIVATE_CONTROL_PAGES - pages)
+		if (count >= GPU_PRIVATE_CONTROL_OBJECTS ||
+		    pages > GPU_PRIVATE_CONTROL_PAGES ||
+		    size / GPU_PRIVATE_PAGE_SIZE >
+			    GPU_PRIVATE_CONTROL_PAGES - pages)
 			return;
 	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
@@ -319,9 +364,10 @@ static void bo_create(const void *owner, const void *service,
 		}
 		{
 			cache_metadata_invalidate();
-			bo->pages = (unsigned int)(size / GPU_PRIVATE_PAGE_SIZE);
+			bo->pages =
+				(unsigned int)(size / GPU_PRIVATE_PAGE_SIZE);
 		}
-		bo->min_ipa = ULONG_MAX;
+		bo->min_ipa_page = UINT32_MAX;
 		result->status = GPU_PRIVATE_SUCCESS;
 		result->value[0] = handle;
 		return;
@@ -329,42 +375,97 @@ static void bo_create(const void *owner, const void *service,
 }
 
 void gpu_private_bo_create(const void *owner, const void *service,
-		unsigned long size, unsigned long access, struct gpu_private_result *result)
+			   unsigned long size, unsigned long access,
+			   struct gpu_private_result *result)
 {
 	bo_create(owner, service, size, access, false, result);
 }
 
 void gpu_private_control_create(const void *service, unsigned long size,
-		struct gpu_private_result *result)
+				struct gpu_private_result *result)
 {
-	bo_create(service, service, size, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE, true, result);
+	bo_create(service, service, size, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE,
+		  true, result);
+}
+
+/* Return the first indexed page whose end lies after ipa. */
+static unsigned int backing_lower_bound(unsigned int block, unsigned int count,
+					unsigned long ipa)
+{
+	unsigned int low = 0U, high = count;
+
+	while (low < high) {
+		unsigned int mid = low + (high - low) / 2U;
+		unsigned long page =
+			(unsigned long)backing[block][backing_order[block][mid]]
+				.ipa_page
+			<< 12U;
+
+		if (page < ipa && ipa - page >= GPU_PRIVATE_PAGE_SIZE)
+			low = mid + 1U;
+		else
+			high = mid;
+	}
+	return low;
+}
+
+static void backing_order_insert(unsigned int block, unsigned int index)
+{
+	unsigned long ipa = (unsigned long)backing[block][index].ipa_page
+			    << 12U;
+	unsigned int at = backing_lower_bound(block, index, ipa);
+	uint16_t *order = backing_order[block];
+
+	memmove(&order[at + 1U], &order[at], (index - at) * sizeof(*order));
+	order[at] = (uint16_t)index;
+}
+
+static void backing_order_remove_last(struct private_bo *bo)
+{
+	unsigned int index = (bo->registered - 1U) % ENTRIES;
+	unsigned int block = bo->blocks[(bo->registered - 1U) / ENTRIES] - 1U;
+	unsigned long ipa = (unsigned long)backing[block][index].ipa_page
+			    << 12U;
+	unsigned int at = backing_lower_bound(block, index + 1U, ipa);
+	uint16_t *order = backing_order[block];
+
+	assert(at <= index && order[at] == index);
+	memmove(&order[at], &order[at + 1U], (index - at) * sizeof(*order));
 }
 
 static void bo_append(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, unsigned long offset,
-		const unsigned long *ipas, size_t count, bool control,
-		struct gpu_private_result *result)
+		      unsigned long handle, unsigned long offset,
+		      const unsigned long *ipas, size_t count, bool control,
+		      struct gpu_private_result *result)
 {
 	struct private_bo *bo = bo_lookup(owner, handle);
 	unsigned int first, last;
 
 	result_init(result);
 	if (ops == NULL || ops->source_page == NULL || bo == NULL ||
-	    bo->control != control || ipas == NULL || bo->closing || bo->resident || bo->uncached || count == 0U ||
+	    bo->control != control || ipas == NULL || bo->closing ||
+	    bo->resident || bo->uncached || count == 0U ||
 	    count > GPU_PRIVATE_BATCH || (offset & PAGE_MASK) != 0UL ||
 	    offset / GPU_PRIVATE_PAGE_SIZE != bo->registered ||
 	    count > bo->pages - bo->registered ||
-	    (control && (ops->hide_page == NULL || ops->restore_page == NULL || ops->clear_page == NULL)))
+	    (control && (ops->hide_page == NULL || ops->restore_page == NULL ||
+			 ops->clear_page == NULL ||
+			 ((ops->pin_control_page == NULL) !=
+			  (ops->unpin_control_page == NULL)))))
 		return;
 	first = bo->registered / ENTRIES;
 	last = (bo->registered + (unsigned int)count - 1U) / ENTRIES;
 	for (unsigned int index = first; index <= last; index++) {
 		if (bo->blocks[index] != 0U)
 			continue;
-		for (unsigned int block = 0U; block < GPU_PRIVATE_BLOCKS; block++) {
+		for (unsigned int block = 0U; block < GPU_PRIVATE_BLOCKS;
+		     block++) {
 			if (backing_owner[block] == 0UL) {
 				backing_owner[block] = handle;
-				bo->blocks[index] = (unsigned short)(block + 1U);
+				bo->blocks[index] =
+					(unsigned short)(block + 1U);
+				backing_min_ipa[block] = UINT32_MAX;
+				backing_max_ipa[block] = 0U;
 				break;
 			}
 		}
@@ -378,7 +479,8 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 	 * publication point, so a failed batch leaves no live partial grant.
 	 */
 	for (size_t i = 0U; i < count; i++) {
-		struct backing_page *page = bo_page(bo, bo->registered + (unsigned int)i);
+		struct backing_page *page =
+			bo_page(bo, bo->registered + (unsigned int)i);
 		unsigned long pa;
 
 		if ((ipas[i] & PAGE_MASK) != 0UL || ipas[i] >= (1UL << 44U) ||
@@ -387,7 +489,8 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 		    (control && (pa == 0UL || pa >= (1UL << 40U))))
 			return;
 		for (size_t j = 0U; j < i; j++) {
-			struct backing_page *previous = bo_page(bo, bo->registered + (unsigned int)j);
+			struct backing_page *previous =
+				bo_page(bo, bo->registered + (unsigned int)j);
 
 			if (previous->ipa_page == ipas[i] >> 12U ||
 			    previous->pa_page == pa >> 12U)
@@ -397,10 +500,21 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 		page->pa_page = (uint32_t)(pa >> 12U);
 	}
 	for (size_t i = 0U; i < count; i++) {
-		if (ipas[i] < bo->min_ipa)
-			bo->min_ipa = ipas[i];
-		if (ipas[i] > bo->max_ipa)
-			bo->max_ipa = ipas[i];
+		unsigned int block =
+			bo->blocks[(bo->registered + i) / ENTRIES] - 1U;
+		uint32_t page = (uint32_t)(ipas[i] >> 12U);
+
+		backing_order_insert(block, (bo->registered + (unsigned int)i) %
+						    ENTRIES);
+
+		if (page < backing_min_ipa[block])
+			backing_min_ipa[block] = page;
+		if (page > backing_max_ipa[block])
+			backing_max_ipa[block] = page;
+		if ((ipas[i] >> 12U) < bo->min_ipa_page)
+			bo->min_ipa_page = (uint32_t)(ipas[i] >> 12U);
+		if ((ipas[i] >> 12U) > bo->max_ipa_page)
+			bo->max_ipa_page = (uint32_t)(ipas[i] >> 12U);
 	}
 	bo->registered += (unsigned int)count;
 	if (control) {
@@ -414,7 +528,9 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 			struct backing_page *page = bo_page(bo, bo->hidden);
 			unsigned long pa = (unsigned long)page->pa_page << 12U;
 
-			if (!ops->hide_page(owner, (unsigned long)page->ipa_page << 12U, pa)) {
+			if (!ops->hide_page(
+				    owner, (unsigned long)page->ipa_page << 12U,
+				    pa)) {
 				{
 					cache_metadata_invalidate();
 					bo->closing = true;
@@ -425,7 +541,10 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 				cache_metadata_invalidate();
 				bo->hidden++;
 			}
-			if (!ops->clear_page(pa)) {
+			if ((ops->pin_control_page != NULL &&
+			     !ops->pin_control_page(owner, handle,
+						    bo->hidden - 1U, pa)) ||
+			    !ops->clear_page(pa)) {
 				{
 					cache_metadata_invalidate();
 					bo->closing = true;
@@ -439,28 +558,32 @@ static void bo_append(const struct gpu_private_ops *ops, const void *owner,
 }
 
 void gpu_private_bo_append(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, unsigned long offset, const unsigned long *ipas,
-		size_t count, struct gpu_private_result *result)
+			   unsigned long handle, unsigned long offset,
+			   const unsigned long *ipas, size_t count,
+			   struct gpu_private_result *result)
 {
 	bo_append(ops, owner, handle, offset, ipas, count, false, result);
 }
 
-void gpu_private_control_append(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, unsigned long offset, const unsigned long *ipas,
-		size_t count, struct gpu_private_result *result)
+void gpu_private_control_append(const struct gpu_private_ops *ops,
+				const void *service, unsigned long handle,
+				unsigned long offset, const unsigned long *ipas,
+				size_t count, struct gpu_private_result *result)
 {
 	bo_append(ops, service, handle, offset, ipas, count, true, result);
 }
 
 void gpu_private_bo_seal(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result)
+			 unsigned long handle,
+			 struct gpu_private_result *result)
 {
 	struct private_bo *bo = bo_lookup(owner, handle);
 	unsigned int budget = GPU_PRIVATE_BATCH;
 
 	result_init(result);
-	if (bo == NULL || bo->control || bo->uncached || ops == NULL || ops->hide_page == NULL ||
-	    ops->sync_page_for_device == NULL || (bo->access & GPU_PRIVATE_EXEC) != 0UL)
+	if (bo == NULL || bo->control || bo->uncached || ops == NULL ||
+	    ops->hide_page == NULL || ops->sync_page_for_device == NULL ||
+	    (bo->access & GPU_PRIVATE_EXEC) != 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
 	if (bo->closing || bo->registered != bo->pages)
@@ -483,7 +606,8 @@ void gpu_private_bo_seal(const struct gpu_private_ops *ops, const void *owner,
 		 * Publish hidden BEFORE a possibly failing flush so destroy retains
 		 * and restores exactly the hidden prefix, including this last page.
 		 */
-		if (!ops->hide_page(owner, (unsigned long)page->ipa_page << 12U, pa)) {
+		if (!ops->hide_page(owner, (unsigned long)page->ipa_page << 12U,
+				    pa)) {
 			{
 				cache_metadata_invalidate();
 				bo->closing = true;
@@ -504,11 +628,13 @@ void gpu_private_bo_seal(const struct gpu_private_ops *ops, const void *owner,
 	}
 complete:
 	result->value[0] = bo->hidden;
-	result->status = bo->hidden == bo->pages ? GPU_PRIVATE_SUCCESS : GPU_PRIVATE_INCOMPLETE;
+	result->status = bo->hidden == bo->pages ? GPU_PRIVATE_SUCCESS :
+						   GPU_PRIVATE_INCOMPLETE;
 }
 
-void gpu_private_bo_uncached(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result)
+void gpu_private_bo_uncached(const struct gpu_private_ops *ops,
+			     const void *owner, unsigned long handle,
+			     struct gpu_private_result *result)
 {
 	struct private_bo *bo = bo_lookup(owner, handle);
 	unsigned int budget = GPU_PRIVATE_BATCH;
@@ -556,18 +682,18 @@ void gpu_private_bo_uncached(const struct gpu_private_ops *ops, const void *owne
 	}
 complete:
 	result->value[0] = bo->hidden;
-	result->status = bo->hidden == bo->pages ? GPU_PRIVATE_SUCCESS : GPU_PRIVATE_INCOMPLETE;
+	result->status = bo->hidden == bo->pages ? GPU_PRIVATE_SUCCESS :
+						   GPU_PRIVATE_INCOMPLETE;
 	return;
-failed:
-	{
-		cache_metadata_invalidate();
-		bo->closing = true;
-	}
+failed: {
+	cache_metadata_invalidate();
+	bo->closing = true;
+}
 }
 
 static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, bool control,
-		struct gpu_private_result *result)
+		       unsigned long handle, bool control,
+		       struct gpu_private_result *result)
 {
 	struct private_bo *bo = bo_lookup(owner, handle);
 	unsigned int budget = GPU_PRIVATE_BATCH;
@@ -575,12 +701,15 @@ static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
 	result_init(result);
 	if (bo == NULL || bo->control != control ||
 	    ((control || bo->resident || bo->uncached) &&
-	     (ops == NULL || ops->restore_page == NULL || ops->clear_page == NULL)))
+	     (ops == NULL || ops->restore_page == NULL ||
+	      ops->clear_page == NULL)))
 		return;
 	if (bo->uncached && ops->hide_page == NULL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (bo->mapped != 0U || bo->pending != 0U || bo->control_gpu_refs != 0U)
+	if ((control && ((ops->pin_control_page == NULL) !=
+			 (ops->unpin_control_page == NULL))) ||
+	    bo->mapped != 0U || bo->pending != 0U || bo->control_gpu_refs != 0U)
 		return;
 	{
 		cache_metadata_invalidate();
@@ -593,7 +722,8 @@ static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
 			unsigned int prefix = bo->hidden & NC_PREFIX;
 			bool pending = (bo->hidden & NC_PENDING) != 0U;
 			unsigned long pa = (unsigned long)page->pa_page << 12U;
-			unsigned long ipa = (unsigned long)page->ipa_page << 12U;
+			unsigned long ipa = (unsigned long)page->ipa_page
+					    << 12U;
 
 			/* Discard untouched WB tail first. A pending page belongs just
 			 * above the completed NC prefix and must stay hidden on failure.
@@ -609,7 +739,8 @@ static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
 				prefix--;
 			}
 			if (pending && bo->registered == prefix + 1U) {
-				if (!ops->clear_page(pa) || !ops->restore_page(owner, ipa, pa))
+				if (!ops->clear_page(pa) ||
+				    !ops->restore_page(owner, ipa, pa))
 					return;
 				{
 					cache_metadata_invalidate();
@@ -623,14 +754,20 @@ static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
 			/* No firmware hold remains. Scrub before making the original
 			 * CPU mapping valid, including after a failed/partial donation.
 			 */
-			if (!ops->clear_page(pa) || !ops->restore_page(owner,
-					(unsigned long)page->ipa_page << 12U, pa))
+			if ((control && ops->unpin_control_page != NULL &&
+			     !ops->unpin_control_page(
+				     owner, handle, bo->registered - 1U, pa)) ||
+			    !ops->clear_page(pa) ||
+			    !ops->restore_page(
+				    owner, (unsigned long)page->ipa_page << 12U,
+				    pa))
 				return;
 			{
 				cache_metadata_invalidate();
 				bo->hidden--;
 			}
 		}
+		backing_order_remove_last(bo);
 		bo->registered--;
 
 		memset(page, 0, sizeof(*page));
@@ -652,37 +789,42 @@ static void bo_destroy(const struct gpu_private_ops *ops, const void *owner,
 }
 
 void gpu_private_bo_destroy(const void *owner, unsigned long handle,
-		struct gpu_private_result *result)
+			    struct gpu_private_result *result)
 {
 	bo_destroy(NULL, owner, handle, false, result);
 }
 
-void gpu_private_bo_release(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result)
+void gpu_private_bo_release(const struct gpu_private_ops *ops,
+			    const void *owner, unsigned long handle,
+			    struct gpu_private_result *result)
 {
 	bo_destroy(ops, owner, handle, false, result);
 }
 
-void gpu_private_control_destroy(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, struct gpu_private_result *result)
+void gpu_private_control_destroy(const struct gpu_private_ops *ops,
+				 const void *service, unsigned long handle,
+				 struct gpu_private_result *result)
 {
 	bo_destroy(ops, service, handle, true, result);
 }
 
-bool gpu_private_control_acquire(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, unsigned int *pages)
+bool gpu_private_control_acquire(const struct gpu_private_ops *ops,
+				 const void *service, unsigned long handle,
+				 unsigned int *pages)
 {
 	struct private_bo *bo = bo_lookup(service, handle);
 
-	if (ops == NULL || ops->clear_page == NULL || pages == NULL || bo == NULL ||
-	    !bo->control || bo->closing || bo->registered != bo->pages ||
-	    bo->hidden != bo->pages || bo->mapped != 0U || bo->control_gpu_refs != 0U)
+	if (ops == NULL || ops->clear_page == NULL || pages == NULL ||
+	    bo == NULL || !bo->control || bo->closing ||
+	    bo->registered != bo->pages || bo->hidden != bo->pages ||
+	    bo->mapped != 0U || bo->control_gpu_refs != 0U)
 		return false;
 	/* The old arena may contain another Client's suspended state after
 	 * reset. Every new firmware binding starts with zeroed private backing.
 	 */
 	for (unsigned int i = 0U; i < bo->pages; i++)
-		if (!ops->clear_page((unsigned long)bo_page(bo, i)->pa_page << 12U))
+		if (!ops->clear_page((unsigned long)bo_page(bo, i)->pa_page
+				     << 12U))
 			return false;
 	{
 		cache_metadata_invalidate();
@@ -693,7 +835,7 @@ bool gpu_private_control_acquire(const struct gpu_private_ops *ops, const void *
 }
 
 bool gpu_private_control_page(const void *service, unsigned long handle,
-		unsigned int index, unsigned long *pa)
+			      unsigned int index, unsigned long *pa)
 {
 	struct private_bo *bo = bo_lookup(service, handle);
 
@@ -708,7 +850,8 @@ void gpu_private_control_release(const void *service, unsigned long handle)
 {
 	struct private_bo *bo = bo_lookup(service, handle);
 
-	assert(bo != NULL && bo->control && bo->mapped == 1U && bo->control_gpu_refs == 0U);
+	assert(bo != NULL && bo->control && bo->mapped == 1U &&
+	       bo->control_gpu_refs == 0U);
 	{
 		cache_metadata_invalidate();
 		bo->mapped = 0U;
@@ -716,7 +859,7 @@ void gpu_private_control_release(const void *service, unsigned long handle)
 }
 
 static unsigned int alloc_table(const struct gpu_private_ops *ops,
-		unsigned long context)
+				unsigned long context)
 {
 	for (unsigned int i = 0U; i < GPU_PRIVATE_TABLES; i++) {
 		unsigned long pa;
@@ -737,7 +880,7 @@ static unsigned int alloc_table(const struct gpu_private_ops *ops,
 }
 
 static unsigned int table_index(const struct gpu_private_ops *ops,
-		unsigned long context, uint64_t descriptor)
+				unsigned long context, uint64_t descriptor)
 {
 	unsigned long pa = (unsigned long)descriptor & ADDRESS_MASK;
 	unsigned long first = ops->table_pa(tables[0]);
@@ -760,17 +903,18 @@ static void forget_leaf(unsigned int table, unsigned int index)
 	for (unsigned int i = first; i < first + 32U; i++)
 		if (leaf_object[table][i] != 0U)
 			return;
-	leaf_groups[table] &= (uint16_t)~(1U << (index / 32U));
+	leaf_groups[table] &= (uint16_t) ~(1U << (index / 32U));
 }
 
 static unsigned int walk(const struct gpu_private_ops *ops,
-		struct private_context *ctx, unsigned long iova,
-		struct table_transaction *transaction)
+			 struct private_context *ctx, unsigned long iova,
+			 struct table_transaction *transaction)
 {
 	unsigned int table = ctx->root;
 
 	for (unsigned int level = 0U; level < 3U; level++) {
-		unsigned int index = (unsigned int)((iova >> (39U - level * 9U)) & 511UL);
+		unsigned int index =
+			(unsigned int)((iova >> (39U - level * 9U)) & 511UL);
 		uint64_t pte = tables[table][index];
 		unsigned int child;
 
@@ -787,7 +931,8 @@ static unsigned int walk(const struct gpu_private_ops *ops,
 			return child;
 		transaction->parent[transaction->count] = (unsigned short)table;
 		transaction->entry[transaction->count] = (unsigned short)index;
-		transaction->child[transaction->count++] = (unsigned short)child;
+		transaction->child[transaction->count++] =
+			(unsigned short)child;
 		tables[table][index] = ops->table_pa(tables[child]) | PTE_TABLE;
 		ops->clean(&tables[table][index], sizeof(uint64_t));
 		table = child;
@@ -796,7 +941,8 @@ static unsigned int walk(const struct gpu_private_ops *ops,
 }
 
 static void rollback_tables(const struct gpu_private_ops *ops,
-		struct private_context *ctx, struct table_transaction *transaction)
+			    struct private_context *ctx,
+			    struct table_transaction *transaction)
 {
 	/* No GPU has seen an inactive context, so these empty preflight tables
 	 * can be returned immediately. Active PTW requires trusted invalidation
@@ -806,7 +952,8 @@ static void rollback_tables(const struct gpu_private_ops *ops,
 		return;
 	while (transaction->count != 0U) {
 		unsigned int index = --transaction->count;
-		uint64_t *entry = &tables[transaction->parent[index]][transaction->entry[index]];
+		uint64_t *entry = &tables[transaction->parent[index]]
+					 [transaction->entry[index]];
 
 		*entry = 0UL;
 		ops->clean(entry, sizeof(*entry));
@@ -814,8 +961,55 @@ static void rollback_tables(const struct gpu_private_ops *ops,
 	}
 }
 
+/* Only an inactive address space may return page-table storage. Removing a
+ * leaf is not enough: keeping empty intermediate tables until CONTEXT_DESTROY
+ * lets ordinary BO churn exhaust the global table pool across Clients.
+ * Walk the trusted parent links and prune bottom-up, retaining the root and
+ * every table that still contains a leaf or another child. A MAP transaction
+ * never uses this path: its empty reservations must survive until commit or
+ * rollback. Activation remains excluded until the caller finishes its edits.
+ */
+static void reclaim_empty_path(const struct gpu_private_ops *ops,
+			       struct private_context *ctx, unsigned long va)
+{
+	unsigned int path[4] = { ctx->root }, indices[3];
+
+	assert(!ctx->activated && ctx->task_refs == 0U && !ctx->quarantined);
+	for (unsigned int level = 0U; level < 3U; level++) {
+		indices[level] =
+			(unsigned int)((va >> (39U - level * 9U)) & 511UL);
+		path[level + 1U] = table_index(
+			ops, ctx->handle, tables[path[level]][indices[level]]);
+		if (path[level + 1U] == GPU_PRIVATE_TABLES)
+			return;
+	}
+	for (unsigned int level = 3U; level != 0U; level--) {
+		unsigned int child = path[level];
+		uint64_t *parent =
+			&tables[path[level - 1U]][indices[level - 1U]];
+
+		if (leaf_groups[child] != 0U)
+			return;
+		/* The summary is only a fast rejection. Check the real descriptors
+		 * and tags before freeing, including non-leaf tables on ascent.
+		 */
+		for (unsigned int i = 0U; i < ENTRIES; i++)
+			if (tables[child][i] != 0UL ||
+			    leaf_object[child][i] != 0U)
+				return;
+		*parent = 0UL;
+		ops->clean(parent, sizeof(*parent));
+		/* The old AS has already been detached (or was never installed).
+		 * Its next activation performs the required root/TLB maintenance;
+		 * no live PTW can follow this link while the storage is reused.
+		 */
+		table_owner[child] = 0UL;
+	}
+}
+
 void gpu_private_context_create(const struct gpu_private_ops *ops,
-		const void *owner, const void *service, struct gpu_private_result *result)
+				const void *owner, const void *service,
+				struct gpu_private_result *result)
 {
 	result_init(result);
 	if (owner == NULL || service == NULL || owner == service)
@@ -845,7 +1039,8 @@ void gpu_private_context_create(const struct gpu_private_ops *ops,
 	}
 }
 
-static bool synchronize(const struct gpu_private_ops *ops, struct private_context *ctx)
+static bool synchronize(const struct gpu_private_ops *ops,
+			struct private_context *ctx)
 {
 	if (!ctx->activated)
 		return true;
@@ -858,7 +1053,8 @@ static bool synchronize(const struct gpu_private_ops *ops, struct private_contex
 }
 
 void gpu_private_context_destroy(const struct gpu_private_ops *ops,
-		const void *owner, unsigned long context, struct gpu_private_result *result)
+				 const void *owner, unsigned long context,
+				 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
@@ -869,8 +1065,8 @@ void gpu_private_context_destroy(const struct gpu_private_ops *ops,
 	/* An activated root needs a trusted stop/detach operation before destroy.
 	 * This core deliberately does not accept a service's "GPU idle" claim.
 	 */
-	if (ctx->mapped != 0U || ctx->pending != 0U || ctx->group_refs != 0U || ctx->task_refs != 0U ||
-	    ctx->activated || ctx->quarantined)
+	if (ctx->mapped != 0U || ctx->pending != 0U || ctx->group_refs != 0U ||
+	    ctx->task_refs != 0U || ctx->activated || ctx->quarantined)
 		return;
 	for (unsigned int i = 0U; i < GPU_PRIVATE_TABLES; i++) {
 		if (table_owner[i] == context) {
@@ -885,7 +1081,7 @@ void gpu_private_context_destroy(const struct gpu_private_ops *ops,
 }
 
 bool gpu_private_context_hold(const void *service, const void *owner,
-		unsigned long context)
+			      unsigned long context)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
@@ -905,25 +1101,30 @@ void gpu_private_context_put(const void *owner, unsigned long context)
 	ctx->group_refs--;
 }
 
-static bool task_hold_batch(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context,
-		const struct gpu_private_command_range *ranges, unsigned int count,
-		unsigned long live_task)
+static bool task_hold_batch(const struct gpu_private_ops *ops,
+			    const void *service, const void *owner,
+			    unsigned long context,
+			    const struct gpu_private_command_range *ranges,
+			    unsigned int count, unsigned long live_task)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	unsigned int remaining = GPU_PRIVATE_BATCH;
 
-	if (ops == NULL || ops->table_pa == NULL || service == NULL || owner == service ||
-	    ctx == NULL || ctx->service != service || ctx->group_refs == 0U ||
-	    ctx->quarantined || ctx->revoked || ctx->task_refs == UINT_MAX ||
+	if (ops == NULL || ops->table_pa == NULL || service == NULL ||
+	    owner == service || ctx == NULL || ctx->service != service ||
+	    ctx->group_refs == 0U || ctx->quarantined || ctx->revoked ||
+	    ctx->map_transaction_active || ctx->task_refs == UINT_MAX ||
 	    ranges == NULL || count == 0U || count > GPU_PRIVATE_TASK_BATCH)
 		return false;
 	if (live_task != 0UL ?
-	    (!ctx->drained || !gpu_private_task_live_eligible(ops, service, owner, context, live_task)) :
-	    ctx->activated)
+		    (!ctx->drained ||
+		     !gpu_private_task_live_eligible(ops, service, owner,
+						     context, live_task)) :
+		    ctx->activated)
 		return false;
 	for (unsigned int member = 0U; member < count; member++) {
-		unsigned long start = ranges[member].start, bytes = ranges[member].bytes;
+		unsigned long start = ranges[member].start,
+			      bytes = ranges[member].bytes;
 		unsigned long first = start & ~PAGE_MASK, last;
 
 		if (bytes == 0UL) {
@@ -931,27 +1132,35 @@ static bool task_hold_batch(const struct gpu_private_ops *ops, const void *servi
 				return false;
 			continue;
 		}
-		if (((start | bytes) & 7UL) != 0UL || start >= GPU_PRIVATE_CONTROL_GPU_VA ||
+		if (((start | bytes) & 7UL) != 0UL ||
+		    start >= GPU_PRIVATE_CONTROL_GPU_VA ||
 		    bytes > GPU_PRIVATE_CONTROL_GPU_VA - start)
 			return false;
 		last = (start + bytes - 1UL) & ~PAGE_MASK;
 		if ((last - first) / GPU_PRIVATE_PAGE_SIZE >= remaining)
 			return false;
-		remaining -= (unsigned int)((last - first) / GPU_PRIVATE_PAGE_SIZE) + 1U;
-		for (unsigned long va = first; va <= last; va += GPU_PRIVATE_PAGE_SIZE) {
+		remaining -=
+			(unsigned int)((last - first) / GPU_PRIVATE_PAGE_SIZE) +
+			1U;
+		for (unsigned long va = first; va <= last;
+		     va += GPU_PRIVATE_PAGE_SIZE) {
 			unsigned int table = walk(ops, ctx, va, NULL);
-			unsigned int index = (unsigned int)((va >> 12U) & 511UL), tag;
+			unsigned int index = (unsigned int)((va >> 12U) &
+							    511UL),
+				     tag;
 			struct private_bo *bo;
 
 			if (table == GPU_PRIVATE_TABLES ||
-			    (tables[table][index] & (PTE_TABLE | PTE_AF | PTE_USER)) !=
-				(PTE_TABLE | PTE_AF | PTE_USER))
+			    (tables[table][index] &
+			     (PTE_TABLE | PTE_AF | PTE_USER)) !=
+				    (PTE_TABLE | PTE_AF | PTE_USER))
 				return false;
 			tag = leaf_object[table][index];
 			if (tag == 0U || tag > GPU_PRIVATE_OBJECTS)
 				return false;
 			bo = &objects[tag - 1U];
-			if (bo->owner != owner || bo->service != service || bo->control || bo->closing)
+			if (bo->owner != owner || bo->service != service ||
+			    bo->control || bo->closing)
 				return false;
 		}
 	}
@@ -959,57 +1168,203 @@ static bool task_hold_batch(const struct gpu_private_ops *ops, const void *servi
 	return true;
 }
 
-bool gpu_private_task_hold_batch(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context,
-		const struct gpu_private_command_range *ranges, unsigned int count)
+bool gpu_private_task_hold_batch(const struct gpu_private_ops *ops,
+				 const void *service, const void *owner,
+				 unsigned long context,
+				 const struct gpu_private_command_range *ranges,
+				 unsigned int count)
 {
-	return task_hold_batch(ops, service, owner, context, ranges, count, 0UL);
+	return task_hold_batch(ops, service, owner, context, ranges, count,
+			       0UL);
+}
+
+bool gpu_private_task_scan_commands(
+	const struct gpu_private_ops *ops, const void *service,
+	const void *owner, unsigned long context,
+	const struct gpu_private_command_range *ranges, unsigned int count,
+	bool (*permit)(uint64_t opcode))
+{
+	struct private_context *ctx = ctx_lookup(owner, context);
+	unsigned int remaining = GPU_PRIVATE_BATCH;
+
+	if (ops == NULL || ops->table_pa == NULL ||
+	    ((ops->map_command_page == NULL) !=
+	     (ops->unmap_command_page == NULL)) ||
+	    (ops->map_command_page == NULL && ops->read_command_page == NULL) ||
+	    permit == NULL || service == NULL || owner == service ||
+	    ctx == NULL || ctx->service != service || ctx->group_refs == 0U ||
+	    ctx->quarantined || ctx->revoked || ctx->map_transaction_active ||
+	    ctx->task_refs == UINT_MAX || ranges == NULL || count == 0U ||
+	    count > GPU_PRIVATE_TASK_BATCH)
+		return false;
+	for (unsigned int member = 0U; member < count; member++) {
+		unsigned long start = ranges[member].start,
+			      bytes = ranges[member].bytes;
+		unsigned long first = start & ~PAGE_MASK, last;
+
+		if (bytes == 0UL) {
+			if (start != 0UL)
+				return false;
+			continue;
+		}
+		if (((start | bytes) & 7UL) != 0UL ||
+		    start >= GPU_PRIVATE_CONTROL_GPU_VA ||
+		    bytes > GPU_PRIVATE_CONTROL_GPU_VA - start)
+			return false;
+		last = (start + bytes - 1UL) & ~PAGE_MASK;
+		if ((last - first) / GPU_PRIVATE_PAGE_SIZE >= remaining)
+			return false;
+		remaining -=
+			(unsigned int)((last - first) / GPU_PRIVATE_PAGE_SIZE) +
+			1U;
+		for (unsigned long va = first; va <= last;
+		     va += GPU_PRIVATE_PAGE_SIZE) {
+			unsigned int table = walk(ops, ctx, va, NULL);
+			unsigned int index =
+				(unsigned int)((va >> 12U) & 511UL);
+			unsigned long page_end = va + GPU_PRIVATE_PAGE_SIZE;
+			unsigned long end = start + bytes < page_end ?
+						    start + bytes :
+						    page_end;
+			size_t page_bytes = (size_t)(end - va);
+			unsigned int tag;
+			struct private_bo *bo;
+			uint64_t pte;
+
+			if (table == GPU_PRIVATE_TABLES)
+				return false;
+			pte = tables[table][index];
+			if ((pte & (PTE_TABLE | PTE_AF | PTE_USER)) !=
+			    (PTE_TABLE | PTE_AF | PTE_USER))
+				return false;
+			tag = leaf_object[table][index];
+			if (tag == 0U || tag > GPU_PRIVATE_OBJECTS)
+				return false;
+			bo = &objects[tag - 1U];
+			if (bo->owner != owner || bo->service != service ||
+			    bo->control || bo->closing)
+				return false;
+			if (ops->map_command_page != NULL) {
+				struct gpu_private_command_view view = { 0 };
+				bool accepted = true;
+
+				if (!ops->map_command_page(pte & ADDRESS_MASK,
+							   &view))
+					return false;
+				if (view.address == NULL)
+					accepted = false;
+				else
+					for (unsigned long offset =
+						     va == first ?
+							     start - first :
+							     0UL;
+					     offset + 8UL <= page_bytes;
+					     offset += 8UL) {
+						uint64_t instruction;
+
+						memcpy(&instruction,
+						       view.address + offset,
+						       sizeof(instruction));
+						if (!permit(instruction >>
+							    56U)) {
+							accepted = false;
+							break;
+						}
+					}
+				ops->unmap_command_page(&view);
+				if (!accepted)
+					return false;
+				continue;
+			}
+			/* Counted-read adapters are used by the pure core models. */
+			/* Keep each snapshot within this already-authorized page and
+			 * command range. The helper locks/maps that page once per bounded
+			 * chunk instead of once per instruction; every copied opcode is
+			 * still checked before any task hold or hardware publication.
+			 * No bytes or decisions survive this call. In particular this is
+			 * not a certificate against later Client stream modification.
+			 */
+			uint64_t instructions[32];
+			for (unsigned long offset =
+				     va == first ? start - first : 0UL;
+			     offset < page_bytes;) {
+				size_t snapshot_bytes = page_bytes - offset;
+
+				if (snapshot_bytes > sizeof(instructions))
+					snapshot_bytes = sizeof(instructions);
+				if (!ops->read_command_page(
+					    pte & ADDRESS_MASK, offset,
+					    instructions, snapshot_bytes))
+					return false;
+				for (size_t word = 0U;
+				     word <
+				     snapshot_bytes / sizeof(instructions[0]);
+				     word++)
+					if (!permit(instructions[word] >> 56U))
+						return false;
+				offset += snapshot_bytes;
+			}
+		}
+	}
+	return true;
 }
 
 bool gpu_private_task_hold_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, const struct gpu_private_command_range *ranges, unsigned int count)
+				const void *service, const void *owner,
+				unsigned long context, unsigned long task,
+				const struct gpu_private_command_range *ranges,
+				unsigned int count)
 {
-	return task != 0UL && task_hold_batch(ops, service, owner, context, ranges, count, task);
+	return task != 0UL && task_hold_batch(ops, service, owner, context,
+					      ranges, count, task);
 }
 
-bool gpu_private_task_hold(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context, unsigned long start,
-		unsigned long bytes)
+bool gpu_private_task_hold(const struct gpu_private_ops *ops,
+			   const void *service, const void *owner,
+			   unsigned long context, unsigned long start,
+			   unsigned long bytes)
 {
-	const struct gpu_private_command_range range = { .start = start, .bytes = bytes };
+	const struct gpu_private_command_range range = { .start = start,
+							 .bytes = bytes };
 
-	return bytes != 0UL && gpu_private_task_hold_batch(ops, service, owner, context, &range, 1U);
+	return bytes != 0UL && gpu_private_task_hold_batch(ops, service, owner,
+							   context, &range, 1U);
 }
 
 bool gpu_private_task_put(const void *owner, unsigned long context)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
-	if (ctx == NULL || ctx->task_refs == 0U || ctx->activated || ctx->quarantined || ctx->revoked)
+	if (ctx == NULL || ctx->task_refs == 0U || ctx->activated ||
+	    ctx->quarantined || ctx->revoked)
 		return false;
 	ctx->task_refs--;
 	return true;
 }
 
 void gpu_private_context_prepare(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long firmware_root, struct gpu_private_result *result)
+				 const void *service, const void *owner,
+				 unsigned long context,
+				 unsigned long firmware_root,
+				 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	unsigned int slot;
 
 	result_init(result);
-	if (service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    ops == NULL || ops->prepare_as == NULL || ops->table_pa == NULL || firmware_root == 0UL)
+	if (service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || ops == NULL || ops->prepare_as == NULL ||
+	    ops->table_pa == NULL || firmware_root == 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || ctx->quiesced || ctx->task_refs == 0U || ctx->pending != 0U ||
+	if (ctx->quarantined || ctx->revoked || ctx->quiesced ||
+	    ctx->task_refs == 0U || ctx->pending != 0U ||
 	    (ctx->activated && !ctx->live_prepared))
 		return;
 	if (ctx->live_prepared) {
 		slot = ctx->slot;
-		if (slot == 0U || slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[slot] != context)
+		if (slot == 0U || slot >= GPU_PRIVATE_AS_SLOTS ||
+		    slot_owner[slot] != context)
 			return;
 	} else {
 		for (slot = 1U; slot < GPU_PRIVATE_AS_SLOTS; slot++)
@@ -1024,36 +1379,44 @@ void gpu_private_context_prepare(const struct gpu_private_ops *ops,
 		slot_owner[slot] = context;
 	}
 	result->status = GPU_PRIVATE_STATE;
-	if (!ops->prepare_as(ops->table_pa(tables[ctx->root]), slot, firmware_root, ctx->live_prepared)) {
+	if (!ops->prepare_as(ops->table_pa(tables[ctx->root]), slot,
+			     firmware_root, ctx->live_prepared)) {
 		ctx->quarantined = true;
 		return;
 	}
 	ctx->live_prepared = true;
 	result->status = GPU_PRIVATE_SUCCESS;
-	result->value[0] = slot; /* Trusted internal result, not an RSI address/root. */
+	result->value[0] =
+		slot; /* Trusted internal result, not an RSI address/root. */
 }
 
 void gpu_private_context_check_running(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long firmware_root, struct gpu_firmware_config *config,
-		struct gpu_private_result *result)
+				       const void *service, const void *owner,
+				       unsigned long context,
+				       unsigned long firmware_root,
+				       struct gpu_firmware_config *config,
+				       struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	unsigned int slot;
 
 	result_init(result);
-	if (service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    config == NULL || ops == NULL || ops->check_running_as == NULL ||
-	    ops->table_pa == NULL || firmware_root == 0UL)
+	if (service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || config == NULL || ops == NULL ||
+	    ops->check_running_as == NULL || ops->table_pa == NULL ||
+	    firmware_root == 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || ctx->quiesced || ctx->task_refs == 0U ||
-	    ctx->pending != 0U || !ctx->activated || !ctx->live_prepared)
+	if (ctx->quarantined || ctx->revoked || ctx->quiesced ||
+	    ctx->task_refs == 0U || ctx->pending != 0U || !ctx->activated ||
+	    !ctx->live_prepared)
 		return;
 	slot = ctx->slot;
-	if (slot == 0U || slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[slot] != context)
+	if (slot == 0U || slot >= GPU_PRIVATE_AS_SLOTS ||
+	    slot_owner[slot] != context)
 		return;
-	if (!ops->check_running_as(ops->table_pa(tables[ctx->root]), slot, firmware_root, config)) {
+	if (!ops->check_running_as(ops->table_pa(tables[ctx->root]), slot,
+				   firmware_root, config)) {
 		ctx->quarantined = true;
 		return;
 	}
@@ -1062,29 +1425,34 @@ void gpu_private_context_check_running(const struct gpu_private_ops *ops,
 }
 
 void gpu_private_context_quiesce(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long firmware_root, struct gpu_private_result *result)
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task,
+				 unsigned long firmware_root,
+				 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
 	result_init(result);
-	if (service == NULL || service == owner || ctx == NULL || ctx->service != service ||
-	    task == 0UL || ops == NULL || ops->table_pa == NULL || ops->detach_as == NULL ||
+	if (service == NULL || service == owner || ctx == NULL ||
+	    ctx->service != service || task == 0UL || ops == NULL ||
+	    ops->table_pa == NULL || ops->detach_as == NULL ||
 	    firmware_root == 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
 	if (ctx->quarantined || ctx->revoked || !ctx->activated ||
 	    (!ctx->live_prepared && !ctx->quiesced) || ctx->task_refs == 0U ||
-	    ctx->pending != 0U || ctx->extension_object != 0UL || ctx->cache_task != task ||
-	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES || ctx->slot == 0U ||
-	    ctx->slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[ctx->slot] != context)
+	    ctx->pending != 0U || ctx->extension_object != 0UL ||
+	    ctx->cache_task != task ||
+	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
+	    ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
+	    slot_owner[ctx->slot] != context)
 		return;
 	/* A partial flush/UPDATE may already have disabled translation. Never
 	 * try to repair/reinstall the root or release backing on that ambiguity.
 	 */
 	ctx->quarantined = true;
 	if (!ops->detach_as(ops->table_pa(tables[ctx->root]), ctx->slot,
-			firmware_root, ctx->quiesced))
+			    firmware_root, ctx->quiesced))
 		return;
 	ctx->quarantined = false;
 	ctx->quiesced = true;
@@ -1099,8 +1467,9 @@ void gpu_private_context_quiesce(const struct gpu_private_ops *ops,
  * The bitmap includes donated control BOs too, but gives them no data lease.
  */
 static bool cache_set_check(struct private_cache_set *set,
-		struct private_context *ctx, const void *service, const void *owner,
-		bool for_cpu, bool acquire, bool *uncached_seen)
+			    struct private_context *ctx, const void *service,
+			    const void *owner, bool for_cpu, bool acquire,
+			    bool *uncached_seen)
 {
 	for (unsigned int word = 0U; word < CACHE_SET_WORDS; word++) {
 		uint64_t bits = set->objects[word];
@@ -1114,17 +1483,21 @@ static bool cache_set_check(struct private_cache_set *set,
 			if (index >= GPU_PRIVATE_OBJECTS)
 				return false;
 			bo = &objects[index];
-			if (bo->service != service || bo->closing || bo->handle == 0UL)
+			if (bo->service != service || bo->closing ||
+			    bo->handle == 0UL)
 				return false;
 			if (bo->control) {
-				if (bo->owner != service || bo->control_gpu_refs == 0U)
+				if (bo->owner != service ||
+				    bo->control_gpu_refs == 0U)
 					return false;
 				continue;
 			}
-			if (bo->owner != owner || (!bo->resident && !bo->uncached) ||
+			if (bo->owner != owner ||
+			    (!bo->resident && !bo->uncached) ||
 			    bo->hidden != bo->pages || bo->mapped == 0U ||
 			    (for_cpu ? bo->cache_context != ctx->handle :
-				(bo->cache_context != 0UL && bo->cache_context != ctx->handle)))
+				       (bo->cache_context != 0UL &&
+					bo->cache_context != ctx->handle)))
 				return false;
 			*uncached_seen |= bo->uncached;
 			if (acquire)
@@ -1135,29 +1508,36 @@ static bool cache_set_check(struct private_cache_set *set,
 }
 
 bool gpu_private_task_live_eligible(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task)
+				    const void *service, const void *owner,
+				    unsigned long context, unsigned long task)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_cache_set *set;
 	bool uncached = false;
 
-	if (ops == NULL || !ops->protected_mapping_summary || service == NULL || service == owner ||
-	    ctx == NULL || ctx->service != service || task == 0UL || ctx->cache_task != task ||
-	    !ctx->activated || !ctx->live_prepared || ctx->quiesced || ctx->quarantined || ctx->revoked ||
-	    ctx->task_refs == 0U || ctx->group_refs == 0U || ctx->pending != 0U ||
-	    ctx->extension_object != 0UL || ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
-	    ctx->cache_pages != 0U || ctx->return_cursor != 0U || ctx->return_pages != 0U ||
-	    ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[ctx->slot] != context)
+	if (ops == NULL || !ops->protected_mapping_summary || service == NULL ||
+	    service == owner || ctx == NULL || ctx->service != service ||
+	    task == 0UL || ctx->cache_task != task || !ctx->activated ||
+	    !ctx->live_prepared || ctx->quiesced || ctx->quarantined ||
+	    ctx->revoked || ctx->task_refs == 0U || ctx->group_refs == 0U ||
+	    ctx->pending != 0U || ctx->extension_object != 0UL ||
+	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
+	    ctx->cache_pages != 0U || ctx->return_cursor != 0U ||
+	    ctx->return_pages != 0U || ctx->slot == 0U ||
+	    ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
+	    slot_owner[ctx->slot] != context)
 		return false;
 	set = cache_set_for(context);
-	if (!set->valid || set->context != context || set->epoch != ctx->mapping_epoch)
+	if (!set->valid || set->context != context ||
+	    set->epoch != ctx->mapping_epoch)
 		return false;
 	/* Only the BO metadata predicates are reusable. All context/token,
 	 * epoch, lifecycle and slot checks above still read fresh state; callers
 	 * still perform real hardware/root/configuration/completion checks.
 	 * No callback or unlock occurs while constructing this summary.
 	 */
-	if (cache_metadata_epoch != 0UL && set->live_epoch == cache_metadata_epoch)
+	if (cache_metadata_epoch != 0UL &&
+	    set->live_epoch == cache_metadata_epoch)
 		return !set->live_uncached || ops->cache_barrier != NULL;
 	if (!cache_set_check(set, ctx, service, owner, true, false, &uncached))
 		return false;
@@ -1167,25 +1547,30 @@ bool gpu_private_task_live_eligible(const struct gpu_private_ops *ops,
 }
 
 bool gpu_private_task_flush_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long firmware_root)
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task,
+				 unsigned long firmware_root)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
 	gpu_private_task_clear_drained(service, owner, context, task);
-	if (!gpu_private_task_live_eligible(ops, service, owner, context, task) ||
-	    firmware_root == 0UL || ops->table_pa == NULL || ops->flush_as == NULL)
+	if (!gpu_private_task_live_eligible(ops, service, owner, context,
+					    task) ||
+	    firmware_root == 0UL || ops->table_pa == NULL ||
+	    ops->flush_as == NULL)
 		return false;
 	/* A previous observation never survives a physical callback. A partial
 	 * flush/barrier must not reopen staging or release any lease/backing.
 	 */
 	ctx->drained = false;
 	ctx->quarantined = true;
-	if (!ops->flush_as(ops->table_pa(tables[ctx->root]), ctx->slot, firmware_root) ||
+	if (!ops->flush_as(ops->table_pa(tables[ctx->root]), ctx->slot,
+			   firmware_root) ||
 	    (ops->cache_barrier != NULL && !ops->cache_barrier()))
 		return false;
 	ctx->quarantined = false;
-	if (!gpu_private_task_live_eligible(ops, service, owner, context, task)) {
+	if (!gpu_private_task_live_eligible(ops, service, owner, context,
+					    task)) {
 		ctx->quarantined = true;
 		return false;
 	}
@@ -1193,7 +1578,8 @@ bool gpu_private_task_flush_live(const struct gpu_private_ops *ops,
 }
 
 bool gpu_private_task_mark_drained(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task)
+				   const void *service, const void *owner,
+				   unsigned long context, unsigned long task)
 {
 	if (!gpu_private_task_live_eligible(ops, service, owner, context, task))
 		return false;
@@ -1202,28 +1588,32 @@ bool gpu_private_task_mark_drained(const struct gpu_private_ops *ops,
 }
 
 void gpu_private_task_clear_drained(const void *service, const void *owner,
-		unsigned long context, unsigned long task)
+				    unsigned long context, unsigned long task)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
-	if (service != NULL && service != owner && ctx != NULL && ctx->service == service &&
-	    task != 0UL && ctx->cache_task == task)
+	if (service != NULL && service != owner && ctx != NULL &&
+	    ctx->service == service && task != 0UL && ctx->cache_task == task)
 		ctx->drained = false;
 }
 
 bool gpu_private_task_is_drained(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task)
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task)
 {
-	return gpu_private_task_live_eligible(ops, service, owner, context, task) &&
-		ctx_lookup(owner, context)->drained;
+	return gpu_private_task_live_eligible(ops, service, owner, context,
+					      task) &&
+	       ctx_lookup(owner, context)->drained;
 }
 
 bool gpu_private_task_put_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task)
+			       const void *service, const void *owner,
+			       unsigned long context, unsigned long task)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
-	if (!gpu_private_task_live_eligible(ops, service, owner, context, task) ||
+	if (!gpu_private_task_live_eligible(ops, service, owner, context,
+					    task) ||
 	    !ctx->drained || ctx->task_refs < 2U)
 		return false;
 	ctx->task_refs--;
@@ -1231,13 +1621,15 @@ bool gpu_private_task_put_live(const struct gpu_private_ops *ops,
 }
 
 bool gpu_private_task_handoff_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long previous, unsigned long next)
+				   const void *service, const void *owner,
+				   unsigned long context,
+				   unsigned long previous, unsigned long next)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
 	if (next == 0UL || next == previous ||
-	    !gpu_private_task_live_eligible(ops, service, owner, context, previous) ||
+	    !gpu_private_task_live_eligible(ops, service, owner, context,
+					    previous) ||
 	    !ctx->drained || ctx->task_refs < 2U)
 		return false;
 	/* No callbacks or publication in this commit. Keep AS, frozen PTE epoch
@@ -1251,9 +1643,10 @@ bool gpu_private_task_handoff_live(const struct gpu_private_ops *ops,
 	return true;
 }
 
-static void task_cache(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, bool for_cpu, struct gpu_private_result *result)
+static void task_cache(const struct gpu_private_ops *ops, const void *service,
+		       const void *owner, unsigned long context,
+		       unsigned long task, bool for_cpu,
+		       struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_cache_set *set;
@@ -1265,17 +1658,20 @@ static void task_cache(const struct gpu_private_ops *ops,
 	bool uncached_seen = false;
 
 	result_init(result);
-	if (service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    task == 0UL || ops == NULL ||
-	    (for_cpu ? ops->sync_page_for_cpu == NULL : ops->sync_page_for_device == NULL))
+	if (service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || task == 0UL || ops == NULL ||
+	    (for_cpu ? ops->sync_page_for_cpu == NULL :
+		       ops->sync_page_for_device == NULL))
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (!ctx->activated || ctx->quarantined || ctx->revoked || ctx->extension_object != 0UL ||
-	    ctx->task_refs == 0U || ctx->pending != 0U ||
+	if (!ctx->activated || ctx->quarantined || ctx->revoked ||
+	    ctx->extension_object != 0UL || ctx->task_refs == 0U ||
+	    ctx->pending != 0U ||
 	    (ctx->cache_task != 0UL && ctx->cache_task != task))
 		return;
 	if (for_cpu) {
-		if (!ctx->quiesced || ctx->live_prepared || ctx->cache_task != task ||
+		if (!ctx->quiesced || ctx->live_prepared ||
+		    ctx->cache_task != task ||
 		    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES)
 			return;
 	} else if (!ctx->live_prepared || ctx->quiesced) {
@@ -1291,10 +1687,24 @@ static void task_cache(const struct gpu_private_ops *ops,
 		/* No physical callback or unlock between preflight and acquisition.
 		 * RETURN still follows real SUSPEND/flush/AS disable in the consumer.
 		 */
-		if (*pages != 0U || ctx->cache_pages != 0U ||
-		    !cache_set_check(set, ctx, service, owner, for_cpu, false, &uncached_seen) ||
-		    !cache_set_check(set, ctx, service, owner, for_cpu, true, &uncached_seen))
+		if (*pages != 0U || ctx->cache_pages != 0U)
 			goto failed;
+		/* A live summary proves that every data lease is already held by
+		 * this context. The mapping/context checks above remain fresh and
+		 * every BO predicate mutation invalidates the summary. No callback
+		 * or unlock occurs before the real NC barrier below; it is never
+		 * replaced by this metadata proof. On a miss retain the two-pass
+		 * preflight/acquisition, including partial-failure semantics.
+		 */
+		if (cache_metadata_epoch != 0UL &&
+		    set->live_epoch == cache_metadata_epoch) {
+			uncached_seen = set->live_uncached;
+		} else if (!cache_set_check(set, ctx, service, owner, for_cpu,
+					    false, &uncached_seen) ||
+			   !cache_set_check(set, ctx, service, owner, for_cpu,
+					    true, &uncached_seen)) {
+			goto failed;
+		}
 		*cursor = GPU_PRIVATE_TABLES * ENTRIES;
 		goto barrier;
 	}
@@ -1336,7 +1746,8 @@ static void task_cache(const struct gpu_private_ops *ops,
 		 * budget, tag and actual PTE checks. A physical callback exits this
 		 * inner walk so the next entry rechecks the table/group boundary.
 		 */
-		for (; index < end && scan_budget != 0U && sync_budget != 0U; index++) {
+		for (; index < end && scan_budget != 0U && sync_budget != 0U;
+		     index++) {
 			unsigned int tag;
 			struct private_bo *bo;
 			uint64_t pte;
@@ -1358,14 +1769,20 @@ static void task_cache(const struct gpu_private_ops *ops,
 				 * The repeated tag word is invariant only within this call's
 				 * callback-free checked BO span, exactly like checked_nc_tag.
 				 */
-				__builtin_memcpy(&tags, __builtin_assume_aligned(
-					&leaf_object[table][index], 8), sizeof(tags));
-				uint64_t present = tables[table][index] & tables[table][index + 1U] &
-					tables[table][index + 2U] & tables[table][index + 3U];
+				__builtin_memcpy(
+					&tags,
+					__builtin_assume_aligned(
+						&leaf_object[table][index], 8),
+					sizeof(tags));
+				uint64_t present = tables[table][index] &
+						   tables[table][index + 1U] &
+						   tables[table][index + 2U] &
+						   tables[table][index + 3U];
 
 				if (tags == checked_nc_tags &&
-				    (present & (PTE_TABLE | PTE_AF | PTE_USER)) ==
-				    (PTE_TABLE | PTE_AF | PTE_USER)) {
+				    (present &
+				     (PTE_TABLE | PTE_AF | PTE_USER)) ==
+					    (PTE_TABLE | PTE_AF | PTE_USER)) {
 					scan_budget -= 4U;
 					*cursor += 4U;
 					index += 3U;
@@ -1399,8 +1816,10 @@ static void task_cache(const struct gpu_private_ops *ops,
 			if (bo->service != service || bo->closing)
 				goto failed;
 			if (ops->protected_mapping_summary && !for_cpu) {
-				set->objects[(tag - 1U) / 64U] |= UINT64_C(1) << ((tag - 1U) % 64U);
-				if (!bo->control && !bo->resident && !bo->uncached)
+				set->objects[(tag - 1U) / 64U] |=
+					UINT64_C(1) << ((tag - 1U) % 64U);
+				if (!bo->control && !bo->resident &&
+				    !bo->uncached)
 					set->eligible = false;
 			}
 			if (bo->control) {
@@ -1409,7 +1828,8 @@ static void task_cache(const struct gpu_private_ops *ops,
 			} else {
 				if (bo->owner != owner ||
 				    (for_cpu ? bo->cache_context != context :
-					(bo->cache_context != 0UL && bo->cache_context != context)))
+					       (bo->cache_context != 0UL &&
+						bo->cache_context != context)))
 					goto failed;
 				/* Do not perform CPU cache maintenance over backing already handed
 				 * to another context, even within this Client. Holds are retained
@@ -1425,12 +1845,19 @@ static void task_cache(const struct gpu_private_ops *ops,
 						goto failed;
 					uncached_seen |= bo->uncached;
 					checked_nc_tag = tag;
-					checked_nc_tags = UINT64_C(0x0001000100010001) * tag;
+					checked_nc_tags =
+						UINT64_C(0x0001000100010001) *
+						tag;
 					(*cursor)++;
 					continue;
 				}
-				if (!(for_cpu ? ops->sync_page_for_cpu((unsigned long)(pte & ADDRESS_MASK)) :
-					ops->sync_page_for_device((unsigned long)(pte & ADDRESS_MASK))))
+				if (!(for_cpu ?
+					      ops->sync_page_for_cpu((
+						      unsigned long)(pte &
+								     ADDRESS_MASK)) :
+					      ops->sync_page_for_device((
+						      unsigned long)(pte &
+								     ADDRESS_MASK))))
 					goto failed;
 				sync_budget--;
 				(*pages)++;
@@ -1441,17 +1868,21 @@ static void task_cache(const struct gpu_private_ops *ops,
 		}
 	}
 barrier:
-	if (uncached_seen && (ops->cache_barrier == NULL || !ops->cache_barrier()))
+	if (uncached_seen &&
+	    (ops->cache_barrier == NULL || !ops->cache_barrier()))
 		goto failed;
-	if (for_cpu && *cursor == GPU_PRIVATE_TABLES * ENTRIES && *pages != ctx->cache_pages)
+	if (for_cpu && *cursor == GPU_PRIVATE_TABLES * ENTRIES &&
+	    *pages != ctx->cache_pages)
 		goto failed;
 	if (ops->protected_mapping_summary && !for_cpu &&
-	    *cursor == GPU_PRIVATE_TABLES * ENTRIES && set->context == context &&
-	    set->epoch == ctx->mapping_epoch && set->eligible && *pages == 0U)
+	    *cursor == GPU_PRIVATE_TABLES * ENTRIES &&
+	    set->context == context && set->epoch == ctx->mapping_epoch &&
+	    set->eligible && *pages == 0U)
 		set->valid = true;
 	result->value[0] = *pages;
 	result->status = *cursor == GPU_PRIVATE_TABLES * ENTRIES ?
-		GPU_PRIVATE_SUCCESS : GPU_PRIVATE_INCOMPLETE;
+				 GPU_PRIVATE_SUCCESS :
+				 GPU_PRIVATE_INCOMPLETE;
 	return;
 failed:
 	set->valid = false;
@@ -1459,35 +1890,41 @@ failed:
 }
 
 void gpu_private_task_cache(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, struct gpu_private_result *result)
+			    const void *service, const void *owner,
+			    unsigned long context, unsigned long task,
+			    struct gpu_private_result *result)
 {
 	task_cache(ops, service, owner, context, task, false, result);
 }
 
 void gpu_private_task_return(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, struct gpu_private_result *result)
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long task,
+			     struct gpu_private_result *result)
 {
 	task_cache(ops, service, owner, context, task, true, result);
 }
 
 void gpu_private_task_returned(const void *service, const void *owner,
-		unsigned long context, unsigned long task, struct gpu_private_result *result)
+			       unsigned long context, unsigned long task,
+			       struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
 	result_init(result);
-	if (service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    task == 0UL)
+	if (service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || task == 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || !ctx->activated || !ctx->quiesced ||
-	    ctx->live_prepared || ctx->pending != 0U || ctx->extension_object != 0UL ||
-	    ctx->task_refs == 0U || ctx->cache_task != task ||
+	if (ctx->quarantined || ctx->revoked || !ctx->activated ||
+	    !ctx->quiesced || ctx->live_prepared || ctx->pending != 0U ||
+	    ctx->extension_object != 0UL || ctx->task_refs == 0U ||
+	    ctx->cache_task != task ||
 	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
-	    ctx->return_cursor != GPU_PRIVATE_TABLES * ENTRIES || ctx->return_pages != ctx->cache_pages ||
-	    ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[ctx->slot] != context)
+	    ctx->return_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
+	    ctx->return_pages != ctx->cache_pages || ctx->slot == 0U ||
+	    ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
+	    slot_owner[ctx->slot] != context)
 		return;
 	/* Completion cursors and the lease are private RMM state under the
 	 * policy lock. No PTE scan, physical cache callback or hardware write
@@ -1498,17 +1935,20 @@ void gpu_private_task_returned(const void *service, const void *owner,
 }
 
 bool gpu_private_task_retire(const void *service, const void *owner,
-		unsigned long context, unsigned long task)
+			     unsigned long context, unsigned long task)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
-	if (service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    ctx->quarantined || ctx->revoked || !ctx->activated || !ctx->quiesced ||
-	    ctx->live_prepared || ctx->pending != 0U || ctx->extension_object != 0UL || ctx->task_refs == 0U ||
-	    task == 0UL || ctx->cache_task != task ||
+	if (service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || ctx->quarantined || ctx->revoked ||
+	    !ctx->activated || !ctx->quiesced || ctx->live_prepared ||
+	    ctx->pending != 0U || ctx->extension_object != 0UL ||
+	    ctx->task_refs == 0U || task == 0UL || ctx->cache_task != task ||
 	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
-	    ctx->return_cursor != GPU_PRIVATE_TABLES * ENTRIES || ctx->return_pages != ctx->cache_pages ||
-	    ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS || slot_owner[ctx->slot] != context)
+	    ctx->return_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
+	    ctx->return_pages != ctx->cache_pages || ctx->slot == 0U ||
+	    ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
+	    slot_owner[ctx->slot] != context)
 		return false;
 	/* Preflight all metadata before releasing anything. BO backing/mapping
 	 * refs remain; only this context's completed cache lease is retired.
@@ -1520,9 +1960,12 @@ bool gpu_private_task_retire(const void *service, const void *owner,
 
 		if (end > GPU_PRIVATE_OBJECTS)
 			end = GPU_PRIVATE_OBJECTS;
-		for (unsigned int i = group * CACHE_LEASE_GROUP_SIZE; i < end; i++)
+		for (unsigned int i = group * CACHE_LEASE_GROUP_SIZE; i < end;
+		     i++)
 			if (objects[i].cache_context == context &&
-			    (objects[i].owner != owner || objects[i].service != service || objects[i].control))
+			    (objects[i].owner != owner ||
+			     objects[i].service != service ||
+			     objects[i].control))
 				return false;
 	}
 	for (unsigned int group = 0U; group < CACHE_LEASE_GROUPS; group++) {
@@ -1532,33 +1975,40 @@ bool gpu_private_task_retire(const void *service, const void *owner,
 
 		if (end > GPU_PRIVATE_OBJECTS)
 			end = GPU_PRIVATE_OBJECTS;
-		for (unsigned int i = group * CACHE_LEASE_GROUP_SIZE; i < end; i++)
-			if (objects[i].cache_context == context)
-				{
-					cache_metadata_invalidate();
-					objects[i].cache_context = 0UL;
-				}
+		for (unsigned int i = group * CACHE_LEASE_GROUP_SIZE; i < end;
+		     i++)
+			if (objects[i].cache_context == context) {
+				cache_metadata_invalidate();
+				objects[i].cache_context = 0UL;
+			}
 	}
 	ctx->cache_groups = 0U;
 	slot_owner[ctx->slot] = 0UL;
 	ctx->slot = 0U;
 	ctx->activated = ctx->quiesced = false;
 	ctx->cache_task = 0UL;
-	ctx->cache_cursor = ctx->cache_pages = ctx->return_cursor = ctx->return_pages = 0U;
+	ctx->cache_cursor = ctx->cache_pages = ctx->return_cursor =
+		ctx->return_pages = 0U;
 	ctx->task_refs--;
 	return true;
 }
 
-static void stage_object_mapping(const struct gpu_private_ops *ops, struct private_context *ctx,
-		struct private_bo *bo, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result)
+static void stage_object_mapping(const struct gpu_private_ops *ops,
+				 struct private_context *ctx,
+				 struct private_bo *bo, unsigned long offset,
+				 unsigned long iova, size_t count,
+				 unsigned long prot,
+				 struct gpu_private_result *result)
 {
 	struct table_transaction transaction = { 0 };
 	unsigned int first;
 
 	result_init(result);
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->mapping_epoch == ULONG_MAX ||
+	if (ctx->mapping_epoch == ULONG_MAX || ctx->map_transaction_active ||
+	    bo->map_context != 0UL ||
+	    (!bo->control && bo->mapped != 0U &&
+	     bo->mapping_cache != (prot & GPU_PRIVATE_CACHE)) ||
 	    ((bo->resident || bo->uncached) && bo->hidden != bo->pages))
 		return;
 	first = (unsigned int)(offset / GPU_PRIVATE_PAGE_SIZE);
@@ -1581,41 +2031,45 @@ static void stage_object_mapping(const struct gpu_private_ops *ops, struct priva
 	 * Partial invalidation failures quarantine the context as before.
 	 */
 	ctx->mapping_epoch++;
+	bo->mapping_cache = (uint16_t)(prot & GPU_PRIVATE_CACHE);
 	for (size_t i = 0U; i < count; i++) {
 		unsigned long va = iova + i * GPU_PRIVATE_PAGE_SIZE;
 		unsigned int table = walk(ops, ctx, va, NULL);
 		unsigned int index = (unsigned int)((va >> 12U) & 511UL);
-		unsigned long pte = ((unsigned long)bo_page(bo, first + (unsigned int)i)->pa_page << 12U) |
+		unsigned long pte =
+			((unsigned long)bo_page(bo, first + (unsigned int)i)
+				 ->pa_page
+			 << 12U) |
 			PTE_TABLE | PTE_AF | PTE_NG | PTE_USER;
 
 		if ((prot & GPU_PRIVATE_WRITE) == 0UL)
 			pte |= PTE_RO;
 		if ((prot & GPU_PRIVATE_EXEC) == 0UL)
 			pte |= PTE_XN;
-		pte |= (prot & GPU_PRIVATE_CACHE) != 0UL ? (3UL << 8U) | (1UL << 2U) : 2UL << 8U;
+		pte |= (prot & GPU_PRIVATE_CACHE) != 0UL ?
+			       (3UL << 8U) | (1UL << 2U) :
+			       2UL << 8U;
 		leaf_object[table][index] = (unsigned short)(bo - objects + 1);
 		leaf_groups[table] |= (uint16_t)(1U << (index / 32U));
 		tables[table][index] = pte;
 		ops->clean(&tables[table][index], sizeof(uint64_t));
-		if (bo->control)
-			{
-				cache_metadata_invalidate();
-				bo->control_gpu_refs++;
-			}
-		else
-			{
-				cache_metadata_invalidate();
-				bo->mapped++;
-			}
+		if (bo->control) {
+			cache_metadata_invalidate();
+			bo->control_gpu_refs++;
+		} else {
+			cache_metadata_invalidate();
+			bo->mapped++;
+		}
 		ctx->mapped++;
 	}
 	result->status = GPU_PRIVATE_SUCCESS;
 	result->value[0] = count * GPU_PRIVATE_PAGE_SIZE;
 }
 
-static void map_object(const struct gpu_private_ops *ops, struct private_context *ctx,
-		struct private_bo *bo, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result)
+static void map_object(const struct gpu_private_ops *ops,
+		       struct private_context *ctx, struct private_bo *bo,
+		       unsigned long offset, unsigned long iova, size_t count,
+		       unsigned long prot, struct gpu_private_result *result)
 {
 	stage_object_mapping(ops, ctx, bo, offset, iova, count, prot, result);
 	if (result->status != GPU_PRIVATE_SUCCESS)
@@ -1629,9 +2083,11 @@ static void map_object(const struct gpu_private_ops *ops, struct private_context
 }
 
 void gpu_private_task_extend(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long object, unsigned long iova,
-		unsigned long firmware_root, struct gpu_private_result *result)
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long task,
+			     unsigned long object, unsigned long iova,
+			     unsigned long firmware_root,
+			     struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = bo_lookup(owner, object);
@@ -1640,46 +2096,55 @@ void gpu_private_task_extend(const struct gpu_private_ops *ops,
 
 	result_init(result);
 	if (service == NULL || service == owner || ctx == NULL || bo == NULL ||
-	    ctx->service != service || bo->service != service || bo->control || bo->closing ||
-	    bo->registered != bo->pages || bo->pages < 32U || bo->pages > 2048U ||
-	    (bo->access & (GPU_PRIVATE_READ | GPU_PRIVATE_WRITE)) != (GPU_PRIVATE_READ | GPU_PRIVATE_WRITE) ||
+	    ctx->service != service || bo->service != service || bo->control ||
+	    bo->closing || bo->registered != bo->pages || bo->pages < 32U ||
+	    bo->pages > 2048U ||
+	    (bo->access & (GPU_PRIVATE_READ | GPU_PRIVATE_WRITE)) !=
+		    (GPU_PRIVATE_READ | GPU_PRIVATE_WRITE) ||
 	    (iova & PAGE_MASK) != 0UL || iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
-	    bo->pages > (GPU_PRIVATE_CONTROL_GPU_VA - iova) / GPU_PRIVATE_PAGE_SIZE ||
-	    task == 0UL || firmware_root == 0UL || ops == NULL || ops->table_pa == NULL ||
-	    ops->clean == NULL || ops->prepare_as == NULL || ops->extend_as == NULL ||
+	    bo->pages > (GPU_PRIVATE_CONTROL_GPU_VA - iova) /
+				GPU_PRIVATE_PAGE_SIZE ||
+	    task == 0UL || firmware_root == 0UL || ops == NULL ||
+	    ops->table_pa == NULL || ops->clean == NULL ||
+	    ops->prepare_as == NULL || ops->extend_as == NULL ||
 	    ops->sync_page_for_device == NULL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || !ctx->activated || !ctx->live_prepared ||
-	    ctx->quiesced || ctx->task_refs == 0U || ctx->pending != 0U || ctx->cache_task != task ||
-	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES || ctx->return_cursor != 0U ||
-	    ctx->return_pages != 0U || ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
+	if (ctx->quarantined || ctx->revoked || !ctx->activated ||
+	    !ctx->live_prepared || ctx->quiesced || ctx->task_refs == 0U ||
+	    ctx->pending != 0U || ctx->cache_task != task ||
+	    ctx->cache_cursor != GPU_PRIVATE_TABLES * ENTRIES ||
+	    ctx->return_cursor != 0U || ctx->return_pages != 0U ||
+	    ctx->slot == 0U || ctx->slot >= GPU_PRIVATE_AS_SLOTS ||
 	    slot_owner[ctx->slot] != context || ctx->mapping_epoch == ULONG_MAX)
 		return;
 	if (ctx->extension_object != 0UL) {
-		if (ctx->extension_object != object || ctx->extension_va != iova ||
-		    bo->cache_context != context || bo->pending == 0U ||
-		    ctx->extension_cursor >= bo->pages)
+		if (ctx->extension_object != object ||
+		    ctx->extension_va != iova || bo->cache_context != context ||
+		    bo->pending == 0U || ctx->extension_cursor >= bo->pages)
 			return;
 	} else {
 		/* A fresh object cannot alias backing already owned by any GPUVM.
 		 * Check the ENTIRE destination before synchronizing a single page;
 		 * an occupied later batch must not leave an authorized prefix.
 		 */
-		if (bo->mapped != 0U || bo->pending != 0U || bo->cache_context != 0UL)
+		if (bo->mapped != 0U || bo->pending != 0U ||
+		    bo->cache_context != 0UL)
 			return;
 		for (unsigned int i = 0U; i < bo->pages; i++) {
 			unsigned long va = iova + i * GPU_PRIVATE_PAGE_SIZE;
 			unsigned int table = walk(ops, ctx, va, NULL);
 
-			if (table != GPU_PRIVATE_TABLES && tables[table][(va >> 12U) & 511UL] != 0UL)
+			if (table != GPU_PRIVATE_TABLES &&
+			    tables[table][(va >> 12U) & 511UL] != 0UL)
 				return;
 		}
 	}
 	/* Existing-root preparation is a read-only check. No Client or Proxy can
 	 * select another AS or repair changed hardware while growing a task.
 	 */
-	gpu_private_context_prepare(ops, service, owner, context, firmware_root, &checked);
+	gpu_private_context_prepare(ops, service, owner, context, firmware_root,
+				    &checked);
 	if (checked.status != GPU_PRIVATE_SUCCESS)
 		return;
 	if (ctx->extension_object == 0UL) {
@@ -1693,22 +2158,28 @@ void gpu_private_task_extend(const struct gpu_private_ops *ops,
 	count = bo->pages - first;
 	if (count > GPU_PRIVATE_BATCH)
 		count = GPU_PRIVATE_BATCH;
-	if (!bo->resident && !bo->uncached && ctx->cache_pages > UINT_MAX - count)
+	if (!bo->resident && !bo->uncached &&
+	    ctx->cache_pages > UINT_MAX - count)
 		goto failed;
 	if ((bo->resident || bo->uncached) && bo->hidden != bo->pages)
 		goto failed;
 	for (unsigned int i = 0U; i < count; i++) {
 		struct backing_page *page = bo_page(bo, first + i);
 
-		if (page == NULL || (!bo->resident && !bo->uncached &&
-		    !ops->sync_page_for_device((unsigned long)page->pa_page << 12U)))
+		if (page == NULL ||
+		    (!bo->resident && !bo->uncached &&
+		     !ops->sync_page_for_device((unsigned long)page->pa_page
+						<< 12U)))
 			goto failed;
 	}
-	if (bo->uncached && (ops->cache_barrier == NULL || !ops->cache_barrier()))
+	if (bo->uncached &&
+	    (ops->cache_barrier == NULL || !ops->cache_barrier()))
 		goto failed;
-	stage_object_mapping(ops, ctx, bo, (unsigned long)first * GPU_PRIVATE_PAGE_SIZE,
+	stage_object_mapping(
+		ops, ctx, bo, (unsigned long)first * GPU_PRIVATE_PAGE_SIZE,
 		iova + (unsigned long)first * GPU_PRIVATE_PAGE_SIZE, count,
-		GPU_PRIVATE_READ | GPU_PRIVATE_WRITE | GPU_PRIVATE_CACHE, &checked);
+		GPU_PRIVATE_READ | GPU_PRIVATE_WRITE | GPU_PRIVATE_CACHE,
+		&checked);
 	if (checked.status != GPU_PRIVATE_SUCCESS)
 		goto failed;
 	/* Account for published leaves BEFORE any uncertain hardware operation.
@@ -1717,10 +2188,13 @@ void gpu_private_task_extend(const struct gpu_private_ops *ops,
 	ctx->extension_cursor += count;
 	if (!bo->resident && !bo->uncached)
 		ctx->cache_pages += count;
-	if (!ops->extend_as(ops->table_pa(tables[ctx->root]), ctx->slot, firmware_root))
+	if (!ops->extend_as(ops->table_pa(tables[ctx->root]), ctx->slot,
+			    firmware_root))
 		goto failed;
 	result->value[0] = ctx->extension_cursor;
-	result->status = ctx->extension_cursor == bo->pages ? GPU_PRIVATE_SUCCESS : GPU_PRIVATE_INCOMPLETE;
+	result->status = ctx->extension_cursor == bo->pages ?
+				 GPU_PRIVATE_SUCCESS :
+				 GPU_PRIVATE_INCOMPLETE;
 	if (result->status == GPU_PRIVATE_SUCCESS) {
 		assert(bo->pending != 0U);
 		bo->pending--;
@@ -1733,19 +2207,22 @@ failed:
 }
 
 void gpu_private_map(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long object, unsigned long offset,
-		unsigned long iova, size_t count, unsigned long prot,
-		struct gpu_private_result *result)
+		     unsigned long context, unsigned long object,
+		     unsigned long offset, unsigned long iova, size_t count,
+		     unsigned long prot, struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = bo_lookup(owner, object);
 
 	result_init(result);
-	if (ctx == NULL || bo == NULL || bo->control || bo->service != ctx->service || bo->closing ||
+	if (ctx == NULL || bo == NULL || bo->control ||
+	    bo->service != ctx->service || bo->closing ||
 	    bo->registered != bo->pages || !range_valid(iova, count) ||
 	    iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
-	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) / GPU_PRIVATE_PAGE_SIZE ||
-	    (offset & PAGE_MASK) != 0UL || offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
+	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) /
+			    GPU_PRIVATE_PAGE_SIZE ||
+	    (offset & PAGE_MASK) != 0UL ||
+	    offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
 	    count > bo->pages - offset / GPU_PRIVATE_PAGE_SIZE ||
 	    (prot & GPU_PRIVATE_READ) == 0UL ||
 	    (prot & ~(GPU_PRIVATE_ACCESS | GPU_PRIVATE_CACHE)) != 0UL ||
@@ -1758,8 +2235,9 @@ void gpu_private_map(const struct gpu_private_ops *ops, const void *owner,
 }
 
 static void unmap_object(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long iova, size_t count, unsigned long control,
-		struct gpu_private_result *result)
+			 unsigned long context, unsigned long iova,
+			 size_t count, unsigned long control,
+			 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
@@ -1767,7 +2245,8 @@ static void unmap_object(const struct gpu_private_ops *ops, const void *owner,
 	if (ctx == NULL || !range_valid(iova, count))
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->task_refs != 0U || ctx->mapping_epoch == ULONG_MAX)
+	if (ctx->quarantined || ctx->map_transaction_active ||
+	    ctx->task_refs != 0U || ctx->mapping_epoch == ULONG_MAX)
 		return;
 	/* Activated contexts require a trusted stop/detach before any backing
 	 * references can be released. Merely invalidating TLBs is insufficient
@@ -1805,25 +2284,24 @@ static void unmap_object(const struct gpu_private_ops *ops, const void *owner,
 		tables[table][index] = 0UL;
 		ops->clean(&tables[table][index], sizeof(uint64_t));
 		forget_leaf(table, index);
-		if (control != 0UL)
-			{
-				cache_metadata_invalidate();
-				objects[object - 1U].control_gpu_refs--;
-			}
-		else
-			{
-				cache_metadata_invalidate();
-				objects[object - 1U].mapped--;
-			}
+		if (control != 0UL) {
+			cache_metadata_invalidate();
+			objects[object - 1U].control_gpu_refs--;
+		} else {
+			cache_metadata_invalidate();
+			objects[object - 1U].mapped--;
+		}
 		ctx->mapped--;
+		if (leaf_groups[table] == 0U)
+			reclaim_empty_path(ops, ctx, va);
 	}
 	result->status = GPU_PRIVATE_SUCCESS;
 	result->value[0] = count * GPU_PRIVATE_PAGE_SIZE;
 }
 
 void gpu_private_unmap(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long iova, size_t count,
-		struct gpu_private_result *result)
+		       unsigned long context, unsigned long iova, size_t count,
+		       struct gpu_private_result *result)
 {
 	result_init(result);
 	if (!range_valid(iova, count) || iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
@@ -1833,8 +2311,9 @@ void gpu_private_unmap(const struct gpu_private_ops *ops, const void *owner,
 }
 
 void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long object, unsigned long offset,
-		unsigned long iova, size_t count, struct gpu_private_result *result)
+			  unsigned long context, unsigned long object,
+			  unsigned long offset, unsigned long iova,
+			  size_t count, struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = bo_lookup(owner, object);
@@ -1843,16 +2322,20 @@ void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
 
 	result_init(result);
 	if (ops == NULL || ops->table_pa == NULL || ops->clean == NULL ||
-	    ctx == NULL || bo == NULL || bo->control || bo->service != ctx->service ||
-	    bo->registered != bo->pages || !range_valid(iova, count) ||
-	    iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
-	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) / GPU_PRIVATE_PAGE_SIZE ||
-	    (offset & PAGE_MASK) != 0UL || offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
+	    ctx == NULL || bo == NULL || bo->control ||
+	    bo->service != ctx->service || bo->registered != bo->pages ||
+	    !range_valid(iova, count) || iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
+	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) /
+			    GPU_PRIVATE_PAGE_SIZE ||
+	    (offset & PAGE_MASK) != 0UL ||
+	    offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
 	    count > bo->pages - offset / GPU_PRIVATE_PAGE_SIZE)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || ctx->activated || ctx->task_refs != 0U ||
-	    ctx->mapping_epoch == ULONG_MAX || table_owner[ctx->root] != context)
+	if (ctx->quarantined || ctx->revoked || ctx->map_transaction_active ||
+	    ctx->activated || ctx->task_refs != 0U ||
+	    ctx->mapping_epoch == ULONG_MAX ||
+	    table_owner[ctx->root] != context)
 		return;
 	/* Under the policy lock, snapshot exactly the leaves owned by this BO.
 	 * Do not turn a failed MAP collision into a range-wide UNMAP. An invalid
@@ -1889,8 +2372,12 @@ void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
 			return;
 		if (tag != (unsigned int)(bo - objects + 1))
 			continue;
-		if ((pte & 3UL) != PTE_TABLE || (pte & ADDRESS_MASK) !=
-		    ((uint64_t)bo_page(bo, offset / GPU_PRIVATE_PAGE_SIZE + i)->pa_page << 12U))
+		if ((pte & 3UL) != PTE_TABLE ||
+		    (pte & ADDRESS_MASK) !=
+			    ((uint64_t)bo_page(
+				     bo, offset / GPU_PRIVATE_PAGE_SIZE + i)
+				     ->pa_page
+			     << 12U))
 			return;
 		selected[i] = (unsigned short)table;
 		matched++;
@@ -1904,13 +2391,17 @@ void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
 	ctx->mapping_epoch++;
 	for (size_t i = 0U; i < count; i++) {
 		unsigned int table = selected[i];
-		unsigned int index = (unsigned int)(((iova >> 12U) + i) & 511UL);
+		unsigned int index =
+			(unsigned int)(((iova >> 12U) + i) & 511UL);
 
 		if (table == GPU_PRIVATE_TABLES)
 			continue;
 		tables[table][index] = 0UL;
 		ops->clean(&tables[table][index], sizeof(uint64_t));
 		forget_leaf(table, index);
+		if (leaf_groups[table] == 0U)
+			reclaim_empty_path(ops, ctx,
+					   iova + i * GPU_PRIVATE_PAGE_SIZE);
 	}
 	{
 		cache_metadata_invalidate();
@@ -1922,36 +2413,42 @@ void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
 }
 
 void gpu_private_control_mapping(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long object, unsigned int first, unsigned int count,
-		bool writable, bool install, struct gpu_private_result *result)
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long object,
+				 unsigned int first, unsigned int count,
+				 bool writable, bool install,
+				 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = bo_lookup(service, object);
-	unsigned long va = GPU_PRIVATE_CONTROL_GPU_VA + (unsigned long)first * 4096UL;
+	unsigned long va =
+		GPU_PRIVATE_CONTROL_GPU_VA + (unsigned long)first * 4096UL;
 
 	result_init(result);
 	if (ops == NULL || ops->table_pa == NULL || ops->clean == NULL ||
-	    service == NULL || owner == service || ctx == NULL || ctx->service != service ||
-	    bo == NULL || !bo->control || bo->closing || bo->mapped != 1U ||
-	    bo->registered != bo->pages || bo->hidden != bo->pages ||
-	    first >= bo->pages || count == 0U || count > bo->pages - first ||
-	    !range_valid(va, count))
+	    service == NULL || owner == service || ctx == NULL ||
+	    ctx->service != service || bo == NULL || !bo->control ||
+	    bo->closing || bo->mapped != 1U || bo->registered != bo->pages ||
+	    bo->hidden != bo->pages || first >= bo->pages || count == 0U ||
+	    count > bo->pages - first || !range_valid(va, count))
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->group_refs == 0U || ctx->task_refs != 0U ||
-	    ctx->activated || ctx->quarantined || ctx->revoked)
+	if (ctx->group_refs == 0U || ctx->task_refs != 0U || ctx->activated ||
+	    ctx->quarantined || ctx->revoked)
 		return;
 	if (install)
-		map_object(ops, ctx, bo, (unsigned long)first * 4096UL, va, count,
-			GPU_PRIVATE_READ | (writable ? GPU_PRIVATE_WRITE : 0UL), result);
+		map_object(
+			ops, ctx, bo, (unsigned long)first * 4096UL, va, count,
+			GPU_PRIVATE_READ | (writable ? GPU_PRIVATE_WRITE : 0UL),
+			result);
 	else
 		unmap_object(ops, owner, context, va, count, object, result);
 }
 
 void gpu_private_context_activate(const struct gpu_private_ops *ops,
-		const void *service, unsigned long context, unsigned long hardware_slot,
-		struct gpu_private_result *result)
+				  const void *service, unsigned long context,
+				  unsigned long hardware_slot,
+				  struct gpu_private_result *result)
 {
 	unsigned long slot = context & 0xffffUL;
 	struct private_context *ctx;
@@ -1964,14 +2461,18 @@ void gpu_private_context_activate(const struct gpu_private_ops *ops,
 	if (ctx->handle != context || ctx->service != service)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || ctx->quiesced || ops->activate == NULL || ops->synchronize == NULL ||
-	    (slot_owner[hardware_slot] != 0UL && slot_owner[hardware_slot] != context) ||
+	if (ctx->quarantined || ctx->revoked || ctx->map_transaction_active ||
+	    ctx->quiesced || ops->activate == NULL ||
+	    ops->synchronize == NULL ||
+	    (slot_owner[hardware_slot] != 0UL &&
+	     slot_owner[hardware_slot] != context) ||
 	    (ctx->activated && ctx->slot != hardware_slot))
 		return;
 	ctx->activated = true;
 	ctx->slot = (unsigned int)hardware_slot;
 	slot_owner[hardware_slot] = context;
-	if (!ops->activate(context, ops->table_pa(tables[ctx->root]), ctx->slot)) {
+	if (!ops->activate(context, ops->table_pa(tables[ctx->root]),
+			   ctx->slot)) {
 		ctx->quarantined = true;
 		return;
 	}
@@ -1981,7 +2482,7 @@ void gpu_private_context_activate(const struct gpu_private_ops *ops,
 }
 
 void gpu_private_query(const void *owner, unsigned long context,
-		unsigned long iova, struct gpu_private_result *result)
+		       unsigned long iova, struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
@@ -1998,10 +2499,12 @@ void gpu_private_query(const void *owner, unsigned long context,
 	result->value[3] = ctx->revoked ? 1UL : 0UL;
 }
 
-void gpu_private_mapping_check(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long object, unsigned long offset,
-		unsigned long iova, size_t count, unsigned long prot,
-		struct gpu_private_result *result)
+void gpu_private_mapping_check(const struct gpu_private_ops *ops,
+			       const void *owner, unsigned long context,
+			       unsigned long object, unsigned long offset,
+			       unsigned long iova, size_t count,
+			       unsigned long prot,
+			       struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = object != 0UL ? bo_lookup(owner, object) : NULL;
@@ -2014,17 +2517,19 @@ void gpu_private_mapping_check(const struct gpu_private_ops *ops, const void *ow
 	if (object == 0UL) {
 		if ((offset | prot) != 0UL)
 			return;
-	} else if (bo == NULL || bo->control || bo->closing || bo->service != ctx->service ||
-		bo->registered != bo->pages || (offset & PAGE_MASK) != 0UL ||
-		offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
-		count > bo->pages - offset / GPU_PRIVATE_PAGE_SIZE ||
-		(prot & GPU_PRIVATE_READ) == 0UL ||
-		(prot & ~(GPU_PRIVATE_ACCESS | GPU_PRIVATE_CACHE)) != 0UL ||
-		(prot & GPU_PRIVATE_ACCESS & ~bo->access) != 0UL) {
+	} else if (bo == NULL || bo->control || bo->closing ||
+		   bo->service != ctx->service || bo->registered != bo->pages ||
+		   (offset & PAGE_MASK) != 0UL ||
+		   offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
+		   count > bo->pages - offset / GPU_PRIVATE_PAGE_SIZE ||
+		   (prot & GPU_PRIVATE_READ) == 0UL ||
+		   (prot & ~(GPU_PRIVATE_ACCESS | GPU_PRIVATE_CACHE)) != 0UL ||
+		   (prot & GPU_PRIVATE_ACCESS & ~bo->access) != 0UL) {
 		return;
 	}
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked || table_owner[ctx->root] != context)
+	if (ctx->quarantined || ctx->revoked || ctx->map_transaction_active ||
+	    table_owner[ctx->root] != context)
 		return;
 	for (size_t i = 0U; i < count; i++) {
 		unsigned long va = iova + i * GPU_PRIVATE_PAGE_SIZE;
@@ -2052,13 +2557,18 @@ void gpu_private_mapping_check(const struct gpu_private_ops *ops, const void *ow
 				return;
 			continue;
 		}
-		expected = ((uint64_t)bo_page(bo, offset / GPU_PRIVATE_PAGE_SIZE + i)->pa_page << 12U) |
-			PTE_TABLE | PTE_AF | PTE_NG | PTE_USER;
+		expected = ((uint64_t)bo_page(
+				    bo, offset / GPU_PRIVATE_PAGE_SIZE + i)
+				    ->pa_page
+			    << 12U) |
+			   PTE_TABLE | PTE_AF | PTE_NG | PTE_USER;
 		if ((prot & GPU_PRIVATE_WRITE) == 0UL)
 			expected |= PTE_RO;
 		if ((prot & GPU_PRIVATE_EXEC) == 0UL)
 			expected |= PTE_XN;
-		expected |= (prot & GPU_PRIVATE_CACHE) != 0UL ? (3UL << 8U) | (1UL << 2U) : 2UL << 8U;
+		expected |= (prot & GPU_PRIVATE_CACHE) != 0UL ?
+				    (3UL << 8U) | (1UL << 2U) :
+				    2UL << 8U;
 		if (pte != expected || tag != (unsigned int)(bo - objects + 1))
 			return;
 	}
@@ -2076,17 +2586,19 @@ void gpu_private_mapping_check(const struct gpu_private_ops *ops, const void *ow
  * well as both endpoint identities. The caller holds the common policy gate;
  * original-command staging then freezes this context before publication.
  */
-bool gpu_private_task_hint_check(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context, unsigned long iova)
+bool gpu_private_task_hint_check(const struct gpu_private_ops *ops,
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long iova)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct gpu_private_result checked;
 	unsigned int table, tag;
 	struct private_bo *bo;
 
-	if (ops == NULL || ops->table_pa == NULL || service == NULL || owner == service ||
-	    ctx == NULL || ctx->service != service || ctx->quarantined || ctx->revoked ||
-	    ctx->group_refs == 0U || (iova & PAGE_MASK) != 0UL || iova == 0UL ||
+	if (ops == NULL || ops->table_pa == NULL || service == NULL ||
+	    owner == service || ctx == NULL || ctx->service != service ||
+	    ctx->quarantined || ctx->revoked || ctx->group_refs == 0U ||
+	    (iova & PAGE_MASK) != 0UL || iova == 0UL ||
 	    iova >= GPU_PRIVATE_CONTROL_GPU_VA)
 		return false;
 	table = walk(ops, ctx, iova, NULL);
@@ -2096,13 +2608,447 @@ bool gpu_private_task_hint_check(const struct gpu_private_ops *ops, const void *
 	if (tag == 0U || tag > GPU_PRIVATE_OBJECTS)
 		return false;
 	bo = &objects[tag - 1U];
-	if (bo->owner != owner || bo->service != service || bo->control || bo->resident ||
-	    bo->closing || !bo->uncached || bo->pages != 1U || bo->registered != 1U ||
-	    bo->hidden != 1U || bo->pending != 0U)
+	if (bo->owner != owner || bo->service != service || bo->control ||
+	    bo->resident || bo->closing || !bo->uncached || bo->pages != 1U ||
+	    bo->registered != 1U || bo->hidden != 1U || bo->pending != 0U)
 		return false;
-	gpu_private_mapping_check(ops, owner, context, bo->handle, 0UL, iova, 1U,
-		GPU_PRIVATE_READ | GPU_PRIVATE_WRITE, &checked);
+	gpu_private_mapping_check(ops, owner, context, bo->handle, 0UL, iova,
+				  1U, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE,
+				  &checked);
 	return checked.status == GPU_PRIVATE_SUCCESS;
+}
+
+static struct private_map_transaction *
+map_tx_lookup(const void *owner, unsigned long handle,
+	      struct private_context **context)
+{
+	unsigned long slot = handle & 0xffffUL;
+	struct private_map_transaction *tx;
+	struct private_context *ctx;
+
+	if (owner == NULL || slot == 0UL || slot > GPU_PRIVATE_CONTEXTS)
+		return NULL;
+	tx = &map_transactions[slot - 1UL];
+	ctx = ctx_lookup(owner, tx->context);
+	if (tx->handle != handle || ctx == NULL)
+		return NULL;
+	*context = ctx;
+	return tx;
+}
+
+static void map_tx_result(const struct private_context *ctx,
+			  const struct private_map_transaction *tx,
+			  struct gpu_private_result *result)
+{
+	result_init(result);
+	result->status = tx->phase == GPU_PRIVATE_MAP_DONE ||
+					 tx->phase == GPU_PRIVATE_MAP_ABORTED ?
+				 GPU_PRIVATE_SUCCESS :
+			 tx->phase == GPU_PRIVATE_MAP_FAILED ?
+				 GPU_PRIVATE_STATE :
+				 GPU_PRIVATE_INCOMPLETE;
+	result->value[0] = tx->handle;
+	(void)ctx;
+	result->value[1] = tx->version;
+	result->value[2] = tx->sequence;
+	result->value[3] = tx->phase;
+}
+
+static uint32_t *map_tx_retired(struct private_map_transaction *tx,
+				unsigned int object)
+{
+	assert(tx->journal[0] < GPU_PRIVATE_BLOCKS &&
+	       object < GPU_PRIVATE_OBJECTS);
+	assert(backing_owner[tx->journal[0]] == tx->handle);
+	return object < ENTRIES ?
+		       &backing[tx->journal[0]][object].ipa_page :
+		       &backing[tx->journal[0]][object - ENTRIES].pa_page;
+}
+
+static void map_tx_release(struct private_context *ctx,
+			   struct private_map_transaction *tx)
+{
+	cache_metadata_invalidate();
+	if (tx->request.object != 0UL) {
+		struct private_bo *bo =
+			bo_lookup(ctx->owner, tx->request.object);
+
+		assert(bo != NULL &&
+		       bo->map_context == (unsigned int)(ctx - contexts) + 1U &&
+		       bo->pending != 0U);
+		bo->pending--;
+		bo->map_context = 0UL;
+	}
+	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
+		uint32_t *retired = map_tx_retired(tx, i);
+
+		if (*retired == 0U)
+			continue;
+		assert(objects[i].mapped >= *retired);
+		cache_metadata_invalidate();
+		objects[i].mapped -= *retired;
+		*retired = 0U;
+	}
+	for (unsigned int i = 0U; i < 2U; i++) {
+		assert(backing_owner[tx->journal[i]] == tx->handle);
+		backing_owner[tx->journal[i]] = 0UL;
+		tx->journal[i] = USHRT_MAX;
+	}
+	assert(ctx->pending != 0U && ctx->map_transaction_active);
+	ctx->pending--;
+	ctx->map_transaction_active = false;
+}
+
+static void map_tx_discard(const struct gpu_private_ops *ops,
+			   struct private_context *ctx,
+			   struct private_map_transaction *tx)
+{
+	/* BEGIN only accepts an AS that was never active or has completed the
+	 * trusted detach path. No activation is possible while pending is held.
+	 * Before the first leaf edit, reverse exactly our empty table links.
+	 */
+	assert(!ctx->activated && !tx->mutated);
+	while (tx->reservations != 0U) {
+		unsigned int i = --tx->reservations;
+		struct backing_page *saved = &backing[tx->journal[1]][i];
+		unsigned int parent = saved->ipa_page & 0xffffU;
+		unsigned int index = saved->ipa_page >> 16U;
+		uint64_t *entry = &tables[parent][index];
+
+		*entry = 0UL;
+		ops->clean(entry, sizeof(*entry));
+		table_owner[saved->pa_page] = 0UL;
+	}
+	map_tx_release(ctx, tx);
+}
+
+void gpu_private_mapping_version(const void *owner, unsigned long context,
+				 struct gpu_private_result *result)
+{
+	struct private_context *ctx = ctx_lookup(owner, context);
+
+	result_init(result);
+	if (ctx == NULL)
+		return;
+	result->status = GPU_PRIVATE_STATE;
+	if (ctx->map_transaction_active || ctx->quarantined || ctx->revoked)
+		return;
+	result->status = GPU_PRIVATE_SUCCESS;
+	result->value[0] = ctx->mapping_epoch;
+}
+
+void gpu_private_map_begin(const struct gpu_private_ops *ops, const void *owner,
+			   unsigned long context,
+			   const struct gpu_private_map_request *request,
+			   struct gpu_private_result *result)
+{
+	struct private_context *ctx = ctx_lookup(owner, context);
+	struct private_map_transaction *tx;
+	struct private_bo *bo = NULL;
+	unsigned long handle;
+	unsigned short journal[2];
+	unsigned int found = 0U;
+
+	result_init(result);
+	if (ctx == NULL || request == NULL || ops == NULL ||
+	    ops->table_pa == NULL || ops->clean == NULL ||
+	    ops->cache_barrier == NULL || request->request_id == 0UL)
+		return;
+	tx = &map_transactions[ctx - contexts];
+	result->status = GPU_PRIVATE_STATE;
+	if (ctx->quarantined || ctx->revoked)
+		return;
+	if (tx->context == context &&
+	    tx->request.request_id == request->request_id) {
+		if (memcmp(&tx->request, request, sizeof(*request)) == 0)
+			map_tx_result(ctx, tx, result);
+		return;
+	}
+	if (ctx->map_transaction_active || ctx->activated ||
+	    ctx->task_refs != 0U || ctx->pending != 0U ||
+	    ctx->mapping_epoch == ULONG_MAX ||
+	    request->version != ctx->mapping_epoch ||
+	    (tx->context == context &&
+	     request->request_id <= tx->request.request_id))
+		return;
+	result->status = GPU_PRIVATE_INPUT;
+	if (request->count == 0UL ||
+	    request->count > GPU_PRIVATE_BO_BLOCKS * ENTRIES ||
+	    (request->iova & PAGE_MASK) != 0UL ||
+	    request->iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
+	    request->count > (GPU_PRIVATE_CONTROL_GPU_VA - request->iova) /
+				     GPU_PRIVATE_PAGE_SIZE)
+		return;
+	if (request->object != 0UL) {
+		bo = bo_lookup(owner, request->object);
+		if (bo == NULL || bo->control || bo->service != ctx->service ||
+		    bo->closing || bo->registered != bo->pages ||
+		    ((bo->resident || bo->uncached) &&
+		     bo->hidden != bo->pages) ||
+		    (request->offset & PAGE_MASK) != 0UL ||
+		    request->offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
+		    request->count >
+			    bo->pages -
+				    request->offset / GPU_PRIVATE_PAGE_SIZE ||
+		    (request->prot & GPU_PRIVATE_READ) == 0UL ||
+		    (request->prot &
+		     ~(GPU_PRIVATE_ACCESS | GPU_PRIVATE_CACHE)) != 0UL ||
+		    (request->prot & GPU_PRIVATE_ACCESS & ~bo->access) != 0UL)
+			return;
+		result->status = GPU_PRIVATE_STATE;
+		/* Also serialize aliases in other contexts until preflight commits. */
+		if (bo->pending != 0U || bo->cache_context != 0UL ||
+		    bo->map_context != 0UL ||
+		    bo->mapped > UINT_MAX - request->count ||
+		    (bo->mapped != 0U &&
+		     bo->mapping_cache != (request->prot & GPU_PRIVATE_CACHE)))
+			return;
+	} else if ((request->offset | request->prot) != 0UL) {
+		return;
+	}
+	result->status = GPU_PRIVATE_FULL;
+	for (unsigned int i = 0U; i < GPU_PRIVATE_BLOCKS && found < 2U; i++)
+		if (backing_owner[i] == 0UL)
+			journal[found++] = (unsigned short)i;
+	if (found != 2U)
+		return;
+	handle = new_handle(TX_PREFIX, (unsigned int)(ctx - contexts));
+	if (handle == 0UL)
+		return;
+	memset(tx, 0, sizeof(*tx));
+	tx->handle = handle;
+	tx->context = context;
+	tx->request = *request;
+	tx->version = request->version;
+	tx->phase = GPU_PRIVATE_MAP_RESERVE;
+	for (unsigned int i = 0U; i < 2U; i++) {
+		tx->journal[i] = journal[i];
+		backing_owner[journal[i]] = handle;
+		memset(backing[journal[i]], 0, sizeof(backing[0]));
+	}
+	if (bo != NULL) {
+		bo->pending++;
+		bo->map_context = (uint16_t)(ctx - contexts + 1);
+	}
+	ctx->pending++;
+	ctx->map_transaction_active = true;
+	/* Once the Client owns VM_BIND, the service cannot edit these PTEs. */
+	ctx->direct_mapping = true;
+	cache_metadata_invalidate();
+	map_tx_result(ctx, tx, result);
+}
+
+bool gpu_private_mapping_accept(const void *service, const void *owner,
+				unsigned long context, unsigned long version)
+{
+	struct private_context *ctx = ctx_lookup(owner, context);
+
+	return ctx != NULL && ctx->service == service && service != NULL &&
+	       !ctx->map_transaction_active && !ctx->quarantined &&
+	       !ctx->revoked &&
+	       /* New Clients send the authoritative version even before the first
+		 * direct bind (group/control mappings can already advance it).
+		 * Zero remains only for existing non-direct diagnostic callers.
+		 */
+	       (version == ctx->mapping_epoch ||
+		(!ctx->direct_mapping && version == 0UL));
+}
+
+void gpu_private_map_step(const struct gpu_private_ops *ops, const void *owner,
+			  unsigned long transaction, unsigned long sequence,
+			  struct gpu_private_result *result)
+{
+	struct private_context *ctx;
+	struct private_map_transaction *tx =
+		map_tx_lookup(owner, transaction, &ctx);
+	struct private_bo *bo;
+	unsigned long end;
+
+	result_init(result);
+	if (tx == NULL || ops == NULL || ops->table_pa == NULL ||
+	    ops->clean == NULL || ops->cache_barrier == NULL)
+		return;
+	result->status = GPU_PRIVATE_STATE;
+	if (ctx->quarantined || ctx->revoked)
+		return;
+	/* Replays never perform another mutation, even after a successful commit. */
+	if (tx->sequence != 0UL && sequence == tx->sequence - 1UL) {
+		*result = tx->last;
+		return;
+	}
+	if (sequence != tx->sequence || !ctx->map_transaction_active ||
+	    ctx->activated || ctx->task_refs != 0U)
+		return;
+	bo = tx->request.object == 0UL ? NULL :
+					 bo_lookup(owner, tx->request.object);
+	if (tx->request.object != 0UL && (bo == NULL || bo->closing))
+		goto failed;
+	end = tx->cursor + GPU_PRIVATE_BATCH;
+	if (end > tx->request.count)
+		end = tx->request.count;
+	if (tx->phase == GPU_PRIVATE_MAP_RESERVE) {
+		for (; tx->cursor < end; tx->cursor++) {
+			unsigned long va = tx->request.iova +
+					   tx->cursor * GPU_PRIVATE_PAGE_SIZE;
+			struct table_transaction reservation = { 0 };
+			unsigned int table = walk(
+				ops, ctx, va, bo != NULL ? &reservation : NULL);
+			unsigned int index =
+				(unsigned int)((va >> 12U) & 511UL);
+			unsigned int tag;
+
+			for (unsigned int i = 0U; i < reservation.count; i++) {
+				unsigned int n = tx->reservations++;
+				struct backing_page *saved =
+					&backing[tx->journal[1]][n];
+
+				assert(n < ENTRIES);
+				saved->ipa_page =
+					reservation.parent[i] |
+					((uint32_t)reservation.entry[i] << 16U);
+				saved->pa_page = reservation.child[i];
+			}
+			if (table == GPU_PRIVATE_TABLES) {
+				if (bo != NULL)
+					goto failed;
+				continue;
+			}
+			tag = leaf_object[table][index];
+			if (tables[table][index] == 0UL && tag == 0U)
+				continue;
+			if (tag == 0U || tag > GPU_PRIVATE_OBJECTS ||
+			    objects[tag - 1U].control ||
+			    objects[tag - 1U].owner != owner ||
+			    objects[tag - 1U].service != ctx->service ||
+			    objects[tag - 1U].mapped == 0U ||
+			    (tables[table][index] &
+			     (PTE_TABLE | PTE_AF | PTE_USER)) !=
+				    (PTE_TABLE | PTE_AF | PTE_USER))
+				goto failed;
+		}
+		if (tx->cursor == tx->request.count) {
+			tx->cursor = 0UL;
+			tx->phase = GPU_PRIVATE_MAP_APPLY;
+		}
+	} else if (tx->phase == GPU_PRIVATE_MAP_APPLY) {
+		cache_metadata_invalidate();
+		if (!tx->mutated) {
+			/* Invalidate internal summaries before any PTE edit. External
+			 * version queries reject pending state until final publication.
+			 */
+			ctx->mapping_epoch++;
+			tx->mutated = true;
+		}
+		for (; tx->cursor < end; tx->cursor++) {
+			unsigned long va = tx->request.iova +
+					   tx->cursor * GPU_PRIVATE_PAGE_SIZE;
+			unsigned int table = walk(ops, ctx, va, NULL);
+			unsigned int index = (unsigned int)((va >> 12U) &
+							    511UL),
+				     tag;
+			uint64_t pte = 0UL;
+
+			if (table == GPU_PRIVATE_TABLES) {
+				if (bo != NULL)
+					goto failed;
+				continue;
+			}
+			tag = leaf_object[table][index];
+			if (tag != 0U) {
+				(*map_tx_retired(tx, tag - 1U))++;
+				ctx->mapped--;
+				forget_leaf(table, index);
+			}
+			if (bo != NULL) {
+				unsigned int first =
+					(unsigned int)(tx->request.offset /
+						       GPU_PRIVATE_PAGE_SIZE);
+
+				pte = ((uint64_t)bo_page(
+					       bo,
+					       first + (unsigned int)tx->cursor)
+					       ->pa_page
+				       << 12U) |
+				      PTE_TABLE | PTE_AF | PTE_NG | PTE_USER;
+				if ((tx->request.prot & GPU_PRIVATE_WRITE) ==
+				    0UL)
+					pte |= PTE_RO;
+				if ((tx->request.prot & GPU_PRIVATE_EXEC) ==
+				    0UL)
+					pte |= PTE_XN;
+				pte |= (tx->request.prot & GPU_PRIVATE_CACHE) !=
+						       0UL ?
+					       (3UL << 8U) | (1UL << 2U) :
+					       2UL << 8U;
+				leaf_object[table][index] =
+					(unsigned short)(bo - objects + 1);
+				leaf_groups[table] |=
+					(uint16_t)(1U << (index / 32U));
+				bo->mapping_cache =
+					(uint16_t)(tx->request.prot &
+						   GPU_PRIVATE_CACHE);
+				cache_metadata_invalidate();
+				bo->mapped++;
+				ctx->mapped++;
+			}
+			tables[table][index] = pte;
+			ops->clean(&tables[table][index], sizeof(pte));
+			if (bo == NULL && leaf_groups[table] == 0U)
+				reclaim_empty_path(ops, ctx, va);
+		}
+		if (tx->cursor == tx->request.count)
+			tx->phase = GPU_PRIVATE_MAP_COMMIT;
+	} else if (tx->phase == GPU_PRIVATE_MAP_COMMIT) {
+		/* The AS is detached, so no live TLB can authorize access. Activation
+		 * later installs/invalidates this root through the trusted backend.
+		 * Complete PTE visibility before exposing the version or old backing.
+		 */
+		if (!ops->cache_barrier())
+			goto failed;
+		map_tx_release(ctx, tx);
+		tx->version = ctx->mapping_epoch;
+		tx->phase = GPU_PRIVATE_MAP_DONE;
+	} else {
+		return;
+	}
+	tx->sequence++;
+	map_tx_result(ctx, tx, result);
+	tx->last = *result;
+	return;
+failed:
+	if (tx->mutated)
+		ctx->quarantined = true;
+	else
+		map_tx_discard(ops, ctx, tx);
+	tx->phase = GPU_PRIVATE_MAP_FAILED;
+	tx->sequence++;
+	map_tx_result(ctx, tx, result);
+	tx->last = *result;
+}
+
+void gpu_private_map_abort(const struct gpu_private_ops *ops, const void *owner,
+			   unsigned long transaction,
+			   struct gpu_private_result *result)
+{
+	struct private_context *ctx;
+	struct private_map_transaction *tx =
+		map_tx_lookup(owner, transaction, &ctx);
+
+	result_init(result);
+	if (tx == NULL || ops == NULL || ops->clean == NULL)
+		return;
+	if (ctx->map_transaction_active) {
+		if (tx->mutated) {
+			ctx->quarantined = true;
+			tx->phase = GPU_PRIVATE_MAP_FAILED;
+		} else {
+			map_tx_discard(ops, ctx, tx);
+			tx->phase = GPU_PRIVATE_MAP_ABORTED;
+		}
+		tx->sequence++;
+		map_tx_result(ctx, tx, &tx->last);
+	}
+	map_tx_result(ctx, tx, result);
 }
 
 void gpu_private_device_revoked(const struct gpu_private_ops *ops)
@@ -2113,6 +3059,14 @@ void gpu_private_device_revoked(const struct gpu_private_ops *ops)
 	 * and verified reset while holding the common ownership policy gate.
 	 */
 	memset(cache_sets, 0, sizeof(cache_sets));
+	/* Reset and MMIO revocation make both replaced and current leaves safe.
+	 * Drop retained transaction references before walking the current PTEs.
+	 */
+	for (unsigned int i = 0U; i < GPU_PRIVATE_CONTEXTS; i++) {
+		if (contexts[i].map_transaction_active)
+			map_tx_release(&contexts[i], &map_transactions[i]);
+		memset(&map_transactions[i], 0, sizeof(map_transactions[i]));
+	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_MAP_GRANTS; i++)
 		if (map_grants[i].handle != 0UL)
 			grant_forget(&map_grants[i]);
@@ -2134,13 +3088,15 @@ void gpu_private_device_revoked(const struct gpu_private_ops *ops)
 			bo = &objects[object - 1U];
 			assert(ctx->mapped != 0U);
 			if (bo->control) {
-				assert(bo->owner == ctx->service && bo->control_gpu_refs != 0U);
+				assert(bo->owner == ctx->service &&
+				       bo->control_gpu_refs != 0U);
 				{
 					cache_metadata_invalidate();
 					bo->control_gpu_refs--;
 				}
 			} else {
-				assert(bo->owner == ctx->owner && bo->mapped != 0U);
+				assert(bo->owner == ctx->owner &&
+				       bo->mapped != 0U);
 				{
 					cache_metadata_invalidate();
 					bo->mapped--;
@@ -2172,7 +3128,8 @@ void gpu_private_device_revoked(const struct gpu_private_ops *ops)
 		ctx->cache_cursor = ctx->cache_pages = 0U;
 		ctx->return_cursor = ctx->return_pages = 0U;
 		if (ctx->extension_object != 0UL) {
-			struct private_bo *bo = bo_lookup(ctx->owner, ctx->extension_object);
+			struct private_bo *bo =
+				bo_lookup(ctx->owner, ctx->extension_object);
 
 			assert(bo != NULL && bo->pending != 0U);
 			bo->pending--;
@@ -2199,13 +3156,36 @@ void gpu_private_device_revoked(const struct gpu_private_ops *ops)
 	}
 }
 
+/* Reuse policy lives in the Client. Only this authority can prove that an
+ * old BO has no access-bearing references; a Proxy close is insufficient.
+ * The BO remains registered to the same owner, with unchanged permissions.
+ */
+void gpu_private_bo_idle(const void *owner, unsigned long handle,
+			 struct gpu_private_result *result)
+{
+	struct private_bo *bo = bo_lookup(owner, handle);
+
+	result_init(result);
+	if (bo == NULL || bo->control || bo->resident)
+		return;
+	result->status = GPU_PRIVATE_STATE;
+	if (bo->closing || !bo->uncached || bo->registered != bo->pages ||
+	    bo->hidden != bo->pages || bo->mapped != 0U || bo->pending != 0U ||
+	    bo->control_gpu_refs != 0U || bo->cache_context != 0UL)
+		return;
+	result->value[0] = (unsigned long)bo->pages * GPU_PRIVATE_PAGE_SIZE;
+	result->status = GPU_PRIVATE_SUCCESS;
+}
+
 void gpu_private_bo_inspect(const void *service, const void *owner,
-		unsigned long object, struct gpu_private_result *result)
+			    unsigned long object,
+			    struct gpu_private_result *result)
 {
 	struct private_bo *bo = bo_lookup(owner, object);
 
 	result_init(result);
-	if (service == NULL || bo == NULL || bo->control || bo->service != service)
+	if (service == NULL || bo == NULL || bo->control ||
+	    bo->service != service)
 		return;
 	result->status = GPU_PRIVATE_STATE;
 	if (bo->closing || bo->registered != bo->pages)
@@ -2218,7 +3198,8 @@ void gpu_private_bo_inspect(const void *service, const void *owner,
 }
 
 void gpu_private_context_inspect(const void *service, const void *owner,
-		unsigned long context, struct gpu_private_result *result)
+				 unsigned long context,
+				 struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
@@ -2229,21 +3210,25 @@ void gpu_private_context_inspect(const void *service, const void *owner,
 }
 
 void gpu_private_service_map(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long authorization, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result)
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long authorization,
+			     unsigned long offset, unsigned long iova,
+			     size_t count, unsigned long prot,
+			     struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_map_grant *grant = grant_lookup(owner, authorization);
 
 	result_init(result);
-	if (service == NULL || ctx == NULL || ctx->service != service || grant == NULL ||
-	    grant->context != context || count == 0U || count > GPU_PRIVATE_BATCH ||
+	if (service == NULL || ctx == NULL || ctx->service != service ||
+	    ctx->direct_mapping || grant == NULL || grant->context != context ||
+	    count == 0U || count > GPU_PRIVATE_BATCH ||
 	    count > grant->count - grant->progress || grant->prot != prot ||
 	    offset != grant->offset + grant->progress * GPU_PRIVATE_PAGE_SIZE ||
 	    iova != grant->iova + grant->progress * GPU_PRIVATE_PAGE_SIZE)
 		return;
-	gpu_private_map(ops, owner, context, grant->object, offset, iova, count, prot, result);
+	gpu_private_map(ops, owner, context, grant->object, offset, iova, count,
+			prot, result);
 	if (result->status == GPU_PRIVATE_SUCCESS) {
 		grant->progress += count;
 		if (grant->progress == grant->count)
@@ -2252,20 +3237,24 @@ void gpu_private_service_map(const struct gpu_private_ops *ops,
 }
 
 void gpu_private_map_authorize(const void *owner, unsigned long context,
-		unsigned long object, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result)
+			       unsigned long object, unsigned long offset,
+			       unsigned long iova, size_t count,
+			       unsigned long prot,
+			       struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_bo *bo = bo_lookup(owner, object);
 
 	result_init(result);
-	if (ctx == NULL || bo == NULL || bo->control || ctx->service != bo->service || bo->closing ||
+	if (ctx == NULL || bo == NULL || bo->control ||
+	    ctx->service != bo->service || bo->closing ||
 	    bo->registered != bo->pages || count == 0U ||
 	    ((bo->resident || bo->uncached) && bo->hidden != bo->pages) ||
 	    ((offset | iova) & PAGE_MASK) != 0UL || iova >= ADDRESS_LIMIT ||
 	    count > (ADDRESS_LIMIT - iova) / GPU_PRIVATE_PAGE_SIZE ||
 	    iova >= GPU_PRIVATE_CONTROL_GPU_VA ||
-	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) / GPU_PRIVATE_PAGE_SIZE ||
+	    count > (GPU_PRIVATE_CONTROL_GPU_VA - iova) /
+			    GPU_PRIVATE_PAGE_SIZE ||
 	    offset / GPU_PRIVATE_PAGE_SIZE >= bo->pages ||
 	    count > bo->pages - offset / GPU_PRIVATE_PAGE_SIZE ||
 	    (prot & GPU_PRIVATE_READ) == 0UL ||
@@ -2273,7 +3262,8 @@ void gpu_private_map_authorize(const void *owner, unsigned long context,
 	    (prot & GPU_PRIVATE_ACCESS & ~bo->access) != 0UL)
 		return;
 	result->status = GPU_PRIVATE_STATE;
-	if (ctx->quarantined || ctx->revoked)
+	if (ctx->quarantined || ctx->revoked || ctx->direct_mapping ||
+	    ctx->map_transaction_active || bo->map_context != 0UL)
 		return;
 	result->status = GPU_PRIVATE_FULL;
 	if (ctx->pending >= GPU_PRIVATE_CONTEXT_GRANTS)
@@ -2287,10 +3277,14 @@ void gpu_private_map_authorize(const void *owner, unsigned long context,
 		handle = new_handle(MAP_PREFIX, i);
 		if (handle == 0UL)
 			return;
-		*grant = (struct private_map_grant) {
-			.owner = owner, .handle = handle, .context = context, .object = object,
-			.offset = offset, .iova = iova, .prot = prot, .count = count
-		};
+		*grant = (struct private_map_grant){ .owner = owner,
+						     .handle = handle,
+						     .context = context,
+						     .object = object,
+						     .offset = offset,
+						     .iova = iova,
+						     .prot = prot,
+						     .count = count };
 		bo->pending++;
 		ctx->pending++;
 		result->status = GPU_PRIVATE_SUCCESS;
@@ -2300,7 +3294,7 @@ void gpu_private_map_authorize(const void *owner, unsigned long context,
 }
 
 void gpu_private_map_cancel(const void *owner, unsigned long authorization,
-		struct gpu_private_result *result)
+			    struct gpu_private_result *result)
 {
 	struct private_map_grant *grant = grant_lookup(owner, authorization);
 
@@ -2312,34 +3306,38 @@ void gpu_private_map_cancel(const void *owner, unsigned long authorization,
 }
 
 void gpu_private_service_map_release(const void *service, const void *owner,
-		unsigned long context, unsigned long authorization,
-		struct gpu_private_result *result)
+				     unsigned long context,
+				     unsigned long authorization,
+				     struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 	struct private_map_grant *grant = grant_lookup(owner, authorization);
 
 	result_init(result);
-	if (service == NULL || ctx == NULL || ctx->service != service || grant == NULL ||
-	    grant->context != context)
+	if (service == NULL || ctx == NULL || ctx->service != service ||
+	    grant == NULL || grant->context != context)
 		return;
 	grant_forget(grant);
 	result->status = GPU_PRIVATE_SUCCESS;
 }
 
 void gpu_private_service_unmap(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long iova, size_t count, struct gpu_private_result *result)
+			       const void *service, const void *owner,
+			       unsigned long context, unsigned long iova,
+			       size_t count, struct gpu_private_result *result)
 {
 	struct private_context *ctx = ctx_lookup(owner, context);
 
 	result_init(result);
-	if (service == NULL || ctx == NULL || ctx->service != service)
+	if (service == NULL || ctx == NULL || ctx->service != service ||
+	    ctx->direct_mapping)
 		return;
 	gpu_private_unmap(ops, owner, context, iova, count, result);
 }
 
 void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
-		const void *owner, struct gpu_private_result *result)
+			       const void *owner,
+			       struct gpu_private_result *result)
 {
 	result_init(result);
 	if (owner == NULL || ops == NULL || ops->clean == NULL ||
@@ -2352,16 +3350,19 @@ void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
 	for (unsigned int i = 0U; i < GPU_PRIVATE_CONTEXTS; i++) {
 		struct private_context *ctx = &contexts[i];
 
-		if (ctx->handle != 0UL && (ctx->owner == owner || ctx->service == owner) &&
+		if (ctx->handle != 0UL &&
+		    (ctx->owner == owner || ctx->service == owner) &&
 		    (!ctx->revoked || ctx->activated || ctx->quarantined ||
-		     ctx->mapped != 0U || ctx->pending != 0U || ctx->group_refs != 0U ||
-		     ctx->task_refs != 0U || ctx->cache_task != 0UL))
+		     ctx->mapped != 0U || ctx->pending != 0U ||
+		     ctx->group_refs != 0U || ctx->task_refs != 0U ||
+		     ctx->cache_task != 0UL))
 			return;
 	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
 		struct private_bo *bo = &objects[i];
 
-		if (bo->handle != 0UL && (bo->owner == owner || bo->service == owner) &&
+		if (bo->handle != 0UL &&
+		    (bo->owner == owner || bo->service == owner) &&
 		    (bo->mapped != 0U || bo->pending != 0U ||
 		     bo->control_gpu_refs != 0U || bo->cache_context != 0UL))
 			return;
@@ -2372,7 +3373,8 @@ void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
 		if (ctx->handle == 0UL)
 			continue;
 		if (ctx->owner == owner) {
-			gpu_private_context_destroy(ops, owner, ctx->handle, result);
+			gpu_private_context_destroy(ops, owner, ctx->handle,
+						    result);
 			if (result->status != GPU_PRIVATE_SUCCESS)
 				return;
 		} else if (ctx->service == owner) {
@@ -2384,11 +3386,10 @@ void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
 	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
 		if (objects[i].handle != 0UL && objects[i].owner != owner &&
-		    objects[i].service == owner)
-			{
-				cache_metadata_invalidate();
-				objects[i].service = NULL;
-			}
+		    objects[i].service == owner) {
+			cache_metadata_invalidate();
+			objects[i].service = NULL;
+		}
 	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
 		struct private_bo *bo = &objects[i];
@@ -2406,7 +3407,8 @@ void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
 	}
 	result_init(result);
 	result->status = gpu_private_owner_busy(owner) ?
-		GPU_PRIVATE_INCOMPLETE : GPU_PRIVATE_SUCCESS;
+				 GPU_PRIVATE_INCOMPLETE :
+				 GPU_PRIVATE_SUCCESS;
 }
 
 bool gpu_private_raw_access_blocked(void)
@@ -2433,31 +3435,62 @@ bool gpu_private_owner_busy(const void *owner)
 			return true;
 	}
 	for (unsigned int i = 0U; i < GPU_PRIVATE_CONTEXTS; i++) {
-		if (contexts[i].handle != 0UL &&
-		    (contexts[i].owner == owner || contexts[i].service == owner))
+		if (contexts[i].handle != 0UL && (contexts[i].owner == owner ||
+						  contexts[i].service == owner))
 			return true;
 	}
 	return false;
 }
 
-bool gpu_private_range_busy(const void *owner, unsigned long ipa, unsigned long size)
+bool gpu_private_range_busy(const void *owner, unsigned long ipa,
+			    unsigned long size)
 {
 	if (owner == NULL || size == 0UL)
 		return false;
 	for (unsigned int i = 0U; i < GPU_PRIVATE_OBJECTS; i++) {
 		struct private_bo *bo = &objects[i];
 
-		if (bo->handle == 0UL || bo->owner != owner || bo->registered == 0U)
+		if (bo->handle == 0UL || bo->owner != owner ||
+		    bo->registered == 0U)
 			continue;
-		if (ipa > bo->max_ipa && ipa - bo->max_ipa >= GPU_PRIVATE_PAGE_SIZE)
-			continue;
-		if (ipa <= bo->min_ipa && bo->min_ipa - ipa >= size)
-			continue;
-		for (unsigned int index = 0U; index < bo->registered; index++) {
-			unsigned long page = (unsigned long)bo_page(bo, index)->ipa_page << 12U;
+		unsigned long max_ipa = (unsigned long)bo->max_ipa_page << 12U;
+		unsigned long min_ipa = (unsigned long)bo->min_ipa_page << 12U;
 
-			if (page >= ipa ? page - ipa < size : ipa - page < GPU_PRIVATE_PAGE_SIZE)
-				return true;
+		if (ipa > max_ipa && ipa - max_ipa >= GPU_PRIVATE_PAGE_SIZE)
+			continue;
+		if (ipa <= min_ipa && min_ipa - ipa >= size)
+			continue;
+		for (unsigned int first = 0U; first < bo->registered;
+		     first += ENTRIES) {
+			unsigned int block = bo->blocks[first / ENTRIES] - 1U;
+			unsigned int end = first + ENTRIES;
+			unsigned long low =
+				(unsigned long)backing_min_ipa[block] << 12U;
+			unsigned long high =
+				(unsigned long)backing_max_ipa[block] << 12U;
+
+			if (ipa > high && ipa - high >= GPU_PRIVATE_PAGE_SIZE)
+				continue;
+			if (ipa <= low && low - ipa >= size)
+				continue;
+			if (end > bo->registered)
+				end = bo->registered;
+			unsigned int at =
+				backing_lower_bound(block, end - first, ipa);
+
+			if (at < end - first) {
+				unsigned long page =
+					(unsigned long)
+						backing[block]
+						       [backing_order[block][at]]
+							       .ipa_page
+					<< 12U;
+
+				if (page >= ipa ?
+					    page - ipa < size :
+					    ipa - page < GPU_PRIVATE_PAGE_SIZE)
+					return true;
+			}
 		}
 	}
 	return false;

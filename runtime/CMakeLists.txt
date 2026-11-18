@@ -24,8 +24,16 @@ target_link_libraries(rmm-runtime
             rmm-lib-opencca
             rmm-platform)
 
+# Persistent internal control views use the platform common low-VA context.
+if(TARGET rmm-plat-common)
+    target_link_libraries(rmm-runtime PRIVATE rmm-plat-common)
+endif()
+
 target_include_directories(rmm-runtime
     PRIVATE "include")
+target_include_directories(rmm-runtime PRIVATE "${RMM_SOURCE_DIR}/../shared/include")
+target_sources(rmm-runtime PRIVATE "core/opencca_gpu_irq.c"
+    "${RMM_SOURCE_DIR}/../shared/opencca_gpu_irq_consumer.c")
 
 arm_config_option(
     NAME RMM_MAX_SIZE
@@ -80,6 +88,7 @@ target_sources(rmm-runtime
             "core/opencca_timers.c"
             "core/opencca_iommu.c"
             "core/opencca_gpu.c"
+            "core/opencca_gpu_role.c"
             "core/opencca_gpu_private.c"
             "core/opencca_gpu_firmware.c"
             "core/opencca_gpu_lease.c")

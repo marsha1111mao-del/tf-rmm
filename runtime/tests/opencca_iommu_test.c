@@ -9,6 +9,7 @@
 #define PAGE 4096UL
 #define TABLE_BASE 0x200000UL
 #define DEVICE 0xfdb50800UL
+#define SERVICE_ENDPOINT 1UL
 static const unsigned char realm_a, realm_b;
 static uintptr_t pool_va;
 static unsigned long device_root;
@@ -176,7 +177,7 @@ int main(int argc, char **argv)
 
 	assert(opencca_gpu_control(NULL, NULL, OPENCCA_GPU_POWER_ON, 0UL, 0UL));
 	assert(opencca_gpu_mmio_grant(&realm_a));
-	assert(opencca_gpu_claim(&realm_a));
+	assert(opencca_gpu_claim(&realm_a, SERVICE_ENDPOINT));
 	result = call(NULL, OPENCCA_IOMMU_VERSION, 0UL, 0UL, 0UL, 0UL);
 	assert(result.status == 0UL && result.value[0] == OPENCCA_IOMMU_ABI);
 	assert(call(&realm_b, OPENCCA_IOMMU_QUERY, guest, 0UL, 0UL, 0UL).status != 0UL);

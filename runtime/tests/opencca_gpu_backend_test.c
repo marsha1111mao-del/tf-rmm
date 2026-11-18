@@ -5,9 +5,39 @@
 #include <opencca_gpu_private.h>
 #include <opencca_gpu_firmware.h>
 #include <mbedtls/sha256.h>
+#include <xshm_endpoint.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+
+/* Test-only optional workload accounting; no production callback is changed.
+ * M5 rollback lacks these symbols and retains the original exact71 budget.
+ */
+extern void plat_opencca_gpu_root_statistics(unsigned long[4]) __attribute__((weak));
+extern void plat_opencca_gpu_as_statistics(unsigned long[4]) __attribute__((weak));
+static void gpu_test_read_budget(unsigned long values[8])
+{
+ memset(values,0,8U*sizeof(*values));
+ if(plat_opencca_gpu_root_statistics)plat_opencca_gpu_root_statistics(values);
+ if(plat_opencca_gpu_as_statistics)plat_opencca_gpu_as_statistics(values+4U);
+}
+
+/* A one-command test case uses the same batch admission as production. */
+static void stage_one(const struct gpu_private_ops *ops, const void *service,
+        const void *owner, unsigned long group, uint32_t queue,
+        unsigned long start, uint32_t bytes, uint32_t flush,
+        struct gpu_private_result *result)
+{
+    const struct gpu_firmware_task_command command = {
+        .start = start, .bytes = bytes, .queue = queue, .latest_flush = flush
+    };
+    gpu_firmware_task_stage_batch(ops, service, owner, group, &command, 1U, 0UL, result);
+}
+
+#ifndef GPU_TEST_SOLO_QUANTUM
+#define GPU_TEST_SOLO_QUANTUM 128U
+#endif
 
 static uint32_t registers[0x80004U / 4U];
 static unsigned int soft_commands, hard_commands, barriers;
@@ -17,6 +47,7 @@ static unsigned int fail_as_command;
 static unsigned int extend_corruption;
 static unsigned int live_flush_corruption;
 static unsigned int drain_case, drain_flushes, drain_post_corruption;
+static unsigned int drain_read_fault, drain_reads_until_fault;
 static unsigned int domain_case;
 static bool domain_active, domain_dispatch_only;
 #ifdef GPU_DOMAIN_RSI_TEST
@@ -24,9 +55,18 @@ static bool domain_policy_locked, domain_dispatch_active;
 #endif
 static unsigned int domain_write_fault;
 static unsigned int domain_read_fault, domain_reads_until_fault;
+/* Test-only allowlist for the two unpublished wrapper writes. */
+static bool domain_prepare_writing;
+static unsigned int domain_prepare_writes;
+static unsigned long domain_prepare_destinations[2];
+static bool domain_read_wait_for_ring;
 static unsigned long domain_idle_group;
 static void model_domain_ack(void);
 static bool drain_barrier_failure;
+#ifdef GPU_DOMAIN_LEASE_TEST
+static unsigned int domain_ready_barrier_fault;
+static unsigned int domain_ready_barriers;
+#endif
 static unsigned char nc_data_visibility[2][2];
 static uint32_t *drain_fault, drain_fault_saved;
 static void drain_corrupt_controls(unsigned int scenario);
@@ -39,6 +79,7 @@ static unsigned long timer_frequency = 1000000UL;
 static unsigned int firmware_doorbells;
 static unsigned int mmio_reads, firmware_checks, shader_checks;
 static unsigned int detach_read_corruption;
+static unsigned int firmware_late_fault;
 static bool firmware_acks = true;
 static unsigned int control_writes, fail_control_write;
 static unsigned int data_syncs, fail_data_sync, fault_after_data_sync;
@@ -151,7 +192,10 @@ static void model_batch_ack(void)
 			uint32_t *sync = (void *)(uintptr_t)(batch_sync + q * 16U);
 			uint32_t *cs = model_groups[0].cs_output[q];
 
-			if (suspend_observe_active) cs[23] = cs[24] = 0U;
+			if (suspend_observe_active) {
+				cs[23] = suspend_observe_case == 4U && q == 1U ? 1U : 0U;
+				cs[24] = suspend_observe_case == 5U && q == 1U ? 5U : 0U;
+			}
 
 			out[0] = in[0];
 			sync[0] = (persistent_case != 0U || batch_case >= 36U) ?
@@ -371,6 +415,8 @@ uint32_t read32(const volatile void *address)
 	uint32_t value = registers[offset / 4UL];
 
 	mmio_reads++;
+	if (offset == 0x304UL && firmware_late_fault != 0U)
+		registers[(firmware_late_fault == 1U ? 0x2000U : 0x20U) / 4U] |= 1U;
 	if (offset == 0UL) firmware_checks++;
 	if (offset == 0x100UL) shader_checks++;
 	/* Restore an invalid precondition only after the precheck should reject;
@@ -467,8 +513,10 @@ void write32(uint32_t value, volatile void *address)
 						model_groups[g].cs_output[q][23] = 0U;
 						model_groups[g].cs_output[q][24] = 0U;
 					}
-					if (suspend_observe_case == 4U) model_groups[g].cs_output[1][23] = 1U;
-					if (suspend_observe_case == 5U) model_groups[g].cs_output[1][24] = 3U;
+					/* Real concurrent firmware can defer an already idle queue
+					 * as part of SUSPEND. This is not a live STATUS snapshot.
+					 */
+					model_groups[g].cs_output[1][24] = 5U;
 					if (suspend_observe_case == 6U) sync[0]--;
 					if (suspend_observe_case == 7U) sync[0]++;
 					if (suspend_observe_case == 8U) sync[2] = 7U;
@@ -928,6 +976,29 @@ static void prepare_mmio(unsigned long firmware_root)
 	detach_replay_mmio(root, firmware_root);
 }
 
+static void firmware_fault_checks(unsigned long root)
+{
+    static uint32_t saved[sizeof(registers)/sizeof(registers[0])];
+    struct gpu_firmware_config config;
+    const unsigned int fields[]={0U,0x18U,0x2400U,0x2404U,0x2408U,0x240cU,0x2430U,0x2434U,0x700U,0x704U,0x304U,0x2000U,0x20U,0x110U,0x114U};
+    unsigned int before=writes;
+    memcpy(saved,registers,sizeof(saved));
+    for(unsigned int i=0U;i<sizeof(fields)/sizeof(fields[0]);i++) {
+        memcpy(registers,saved,sizeof(saved));
+        registers[fields[i]/4U] ^= fields[i]==0U ? 1U<<24U : 1U;
+        assert(!plat_opencca_gpu_firmware_configuration(root,&config));
+    }
+    for(firmware_late_fault=1U;firmware_late_fault<=2U;firmware_late_fault++) {
+        memcpy(registers,saved,sizeof(saved));
+        assert(!plat_opencca_gpu_firmware_configuration(root,&config));
+    }
+    firmware_late_fault=0U;
+    memcpy(registers,saved,sizeof(saved));
+    assert(writes==before);
+    assert(plat_opencca_gpu_firmware_configuration(root,&config));
+    puts("GPU_FIRMWARE_FAULT_BOUNDARY=PASS static=15 late_fault=2 no_writes MODEL_ONLY");
+}
+
 static void firmware_mmio(void)
 {
 	const unsigned long root = 0x100002000UL;
@@ -964,6 +1035,7 @@ static void firmware_mmio(void)
 	assert(plat_opencca_gpu_firmware_boot(root));
 	assert(firmware_starts == 1U && registers[0x700U / 4U] == 2U);
 	assert(plat_opencca_gpu_firmware_configuration(root, &config));
+	firmware_fault_checks(root);
 	assert(config.shader_mask == UINT64_C(0x10000000f));
 	assert(config.poweroff_timer == 10U && config.idle_timer == 1U && config.ack_timeout_ticks == 100000UL);
 	before = writes;
@@ -1072,6 +1144,15 @@ static void private_pt(void)
 }
 
 static unsigned char client_a, client_b, service, stranger;
+static unsigned long service_endpoint(void)
+{
+	unsigned long output[4];
+
+	assert(xshm_endpoint_call(&service, XSHM_REGISTER, 0UL, 0UL,
+				 output) == XSHM_SUCCESS);
+	return xshm_endpoint_id(&service);
+}
+#define SERVICE_ENDPOINT service_endpoint()
 static const unsigned char *table_base;
 static unsigned long latest_table_pa;
 static bool alias_revoked;
@@ -1096,6 +1177,20 @@ static bool resolve(const void *owner, unsigned long ipa, unsigned long *pa)
 	return true; /* RTT metadata translation; never read the data page. */
 }
 
+static bool private_data_read(unsigned long pa, size_t offset, void *data, size_t bytes)
+{
+	unsigned long base = pa >= 0x80400000UL ? 0x80400000UL :
+		pa >= 0x80100000UL ? 0x80100000UL :
+		pa >= 0x40400000UL ? 0x40400000UL :
+		pa >= 0x40100000UL ? 0x40100000UL : 0UL;
+
+	if (base == 0UL || pa - base >= (GPU_PRIVATE_BATCH + 1U) * 4096UL ||
+	    offset > 4096U || bytes > 4096U - offset || data == NULL)
+		return false;
+	memset(data, 0, bytes);
+	return true;
+}
+
 static unsigned long table_address(const void *table)
 {
 	if (table_base == NULL)
@@ -1115,19 +1210,21 @@ static bool activate_private(unsigned long context, unsigned long root,
 		unsigned int slot)
 {
 	assert(context != 0UL && alias_revoked);
-	return opencca_gpu_service_isolated(&service) &&
+	return opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT) &&
 		plat_opencca_gpu_pt_install(root, slot);
 }
 
 static bool sync_private(unsigned long context, unsigned long root)
 {
 	assert(context != 0UL);
-	return opencca_gpu_service_isolated(&service) && plat_opencca_gpu_pt_sync(root);
+	return opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT) &&
+	       plat_opencca_gpu_pt_sync(root);
 }
 
 static const struct gpu_private_ops private_ops = {
 	.source_page = resolve, .table_pa = table_address, .clean = table_clean,
-	.activate = activate_private, .synchronize = sync_private
+	.activate = activate_private, .synchronize = sync_private,
+	.read_page = private_data_read, .read_command_page = private_data_read
 };
 
 static void authorized_page(const void *owner, unsigned long context,
@@ -1176,9 +1273,12 @@ static void private_integration(void)
 
 	initialize();
 	assert(opencca_gpu_control(&device_ops, NULL, OPENCCA_GPU_POWER_ON, 0UL, 0UL));
-	assert(opencca_gpu_mmio_grant(&service) && opencca_gpu_claim(&service));
-	assert(opencca_gpu_service_isolate(&device_ops, &service));
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(opencca_gpu_mmio_grant(&service) &&
+	       opencca_gpu_claim(&service, SERVICE_ENDPOINT));
+	assert(opencca_gpu_service_isolate(&device_ops, &service,
+					    SERVICE_ENDPOINT));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	for (unsigned int i = 0U; i < 2U; i++) {
 		gpu_private_bo_create(owners[i], &service, 8192UL, 3UL, &result);
 		assert(result.status == 0UL);
@@ -1352,13 +1452,15 @@ static bool fw_notify(unsigned long root)
 
 static bool fw_install(unsigned long root)
 {
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	return plat_opencca_gpu_firmware_install(root);
 }
 
 static bool fw_boot(unsigned long root)
 {
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	return plat_opencca_gpu_firmware_boot(root);
 }
 
@@ -1458,10 +1560,16 @@ static bool donated_write(unsigned long pa, size_t offset, const void *source, s
 #ifdef GPU_DOMAIN_RSI_TEST
 	if (domain_dispatch_active) assert(domain_policy_locked);
 #endif
+	if (domain_prepare_writing) {
+		assert(domain_prepare_writes < 2U && bytes == 128U);
+		assert(pa + offset == domain_prepare_destinations[domain_prepare_writes]);
+		domain_prepare_writes++;
+	}
 	control_writes++;
 	if (control_writes == fail_control_write)
 		return false;
 	memcpy(donated_pages[index] + offset, source, bytes);
+	if (domain_active) domain_read_wait_for_ring = false;
 	if (domain_active && domain_write_fault >= 6U) {
 		if (domain_write_fault <= 23U) {
 			drain_corrupt_controls(domain_write_fault - 5U);
@@ -1491,13 +1599,15 @@ static bool donated_write(unsigned long pa, size_t offset, const void *source, s
 static bool prepare_private(unsigned long root, unsigned int slot,
 		unsigned long firmware_root, bool existing)
 {
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	return plat_opencca_gpu_pt_prepare(root, slot, firmware_root, existing);
 }
 
 static bool extend_private(unsigned long root, unsigned int slot, unsigned long firmware_root)
 {
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	return plat_opencca_gpu_pt_extend(root, slot, firmware_root);
 }
 
@@ -1524,7 +1634,9 @@ static bool detach_private(unsigned long root, unsigned int slot,
 			if (model_groups[selected].input[20] == slot) break;
 		assert(selected < model_group_count);
 	}
-	assert(alias_revoked && opencca_gpu_service_isolated(&service) && (track_stop || batch_mode || (track_complete &&
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT) &&
+	       (track_stop || batch_mode || (track_complete &&
 		(model_groups[selected].output[0] & 7U) == 2U)));
 	assert_model_nonexecuting(selected);
 	assert(model_groups[selected].input[20] == slot);
@@ -1533,12 +1645,31 @@ static bool detach_private(unsigned long root, unsigned int slot,
 
 static bool drain_barrier(void)
 {
+#ifdef GPU_DOMAIN_LEASE_TEST
+	domain_ready_barriers++;
+	if (domain_ready_barrier_fault != 0U) {
+		unsigned int fault = domain_ready_barrier_fault;
+		unsigned int as = model_groups[launch_csg].input[20];
+
+		domain_ready_barrier_fault = 0U;
+		if (fault == 10U)
+			return false;
+		assert(drain_fault == NULL);
+		drain_fault = fault == 11U ? &registers[0x2000U / 4U] :
+			fault == 12U ? &registers[(0x2400U + as * 0x40U) / 4U] :
+			fault == 13U ? &registers[0x2400U / 4U] :
+			fault == 14U ? &registers[0x704U / 4U] : &model_glb_out[4];
+		drain_fault_saved = *drain_fault;
+		*drain_fault ^= 0x1000U;
+	}
+#endif
 	return !drain_barrier_failure;
 }
 
 static bool flush_private(unsigned long root, unsigned int slot, unsigned long firmware_root)
 {
-	assert(alias_revoked && opencca_gpu_service_isolated(&service));
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 	drain_flushes++;
 	bool ok = plat_opencca_gpu_pt_flush_live(root, slot, firmware_root);
 
@@ -1646,7 +1777,7 @@ static bool donated_read(unsigned long pa, size_t offset, void *data, size_t byt
 		memcpy(data, donated_pages[index] + offset, bytes);
 		/* Mutate after the last snapshot copy: only the post-read START
 		 * check can reject this otherwise valid queue observation. */
-		if (domain_read_fault != 0U && --domain_reads_until_fault == 0U) {
+		if (domain_read_fault != 0U && !domain_read_wait_for_ring && --domain_reads_until_fault == 0U) {
 			unsigned int as = model_groups[launch_csg].input[20];
 			drain_fault = domain_read_fault == 1U ? &registers[(0x2400U + as * 0x40U) / 4U] :
 				domain_read_fault == 2U ? &registers[0x2400U / 4U] :
@@ -1666,6 +1797,15 @@ static bool donated_read(unsigned long pa, size_t offset, void *data, size_t byt
 		if (drain_case == 60U && launch_csg == 0U && drain_flushes != 0U)
 			return false;
 		memcpy(data, donated_pages[index] + offset, bytes);
+		if (drain_read_fault != 0U && --drain_reads_until_fault == 0U) {
+			unsigned int as = model_groups[launch_csg].input[20];
+
+			drain_fault = drain_read_fault == 1U ? &registers[(0x2400U + as * 0x40U) / 4U] :
+				drain_read_fault == 2U ? &registers[0x2400U / 4U] : &model_glb_out[4];
+			drain_fault_saved = *drain_fault;
+			*drain_fault ^= 0x1000U;
+			drain_read_fault = 0U;
+		}
 		return true;
 	}
 	if (finish_case != 0U && status_cleans == 0U) {
@@ -1678,10 +1818,10 @@ static bool donated_read(unsigned long pa, size_t offset, void *data, size_t byt
 		return true; /* Device progress is still made by model_status_ack. */
 	}
 	unsigned int read = complete_reads_this_call++;
-	unsigned int expected = read < 3U ? read : 2U;
+	unsigned int expected = read % 3U;
 	unsigned int as = model_groups[launch_csg].input[20];
 
-	assert(!donated_visible[index] && read < 4U && bytes == 16U && data != NULL);
+	assert(!donated_visible[index] && read < 6U && bytes == 16U && data != NULL);
 	assert(pa == complete_read_pa[expected] && offset == (expected == 2U ? launch_queue * 16U : 0U));
 	control_reads++;
 	if (complete_case == 77U && read == 1U)
@@ -1690,26 +1830,40 @@ static bool donated_read(unsigned long pa, size_t offset, void *data, size_t byt
 		registers[0x2000U / 4U] = 1U;
 	if (complete_boundary_case != 0U && read == 2U)
 		complete_boundary_inject(as);
-	if (read == 3U) {
-		assert(registers[(0x2400U + as * 0x40U) / 4U] == 0U);
-		if (complete_case == 84U)
+	if (read == 3U || read == 5U) {
+		if (read == 3U) assert(registers[(0x2400U + as * 0x40U) / 4U] == 0U);
+		if (complete_case == 84U && read == 5U)
 			((uint32_t *)(donated_pages[index] + offset))[2] = 7U;
-		if (complete_case == 85U)
+		if (complete_case == 85U && read == 3U)
 			registers[0x2000U / 4U] = 1U;
-		if (complete_case == 86U)
+		if (complete_case == 86U && read == 3U)
 			registers[(0x2400U + as * 0x40U) / 4U] = 0x1000U;
 	}
 	memcpy(data, donated_pages[index] + offset, bytes);
 	return true;
 }
 
+#ifdef GPU_DOMAIN_LEASE_TEST
+static bool lease_running_private(unsigned long root, unsigned int slot,
+		unsigned long firmware_root, struct gpu_firmware_config *config)
+{
+	assert(alias_revoked &&
+	       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
+	return plat_opencca_gpu_pt_check_running(root, slot, firmware_root, config);
+}
+#endif
+
 static const struct gpu_private_ops donated_ops = {
 	.source_page = donated_source, .hide_page = donated_hide,
 	.restore_page = donated_restore, .clear_page = donated_clear,
 	.table_pa = table_address, .clean = table_clean,
 	.prepare_as = prepare_private, .extend_as = extend_private, .write_page = donated_write,
+#ifdef GPU_DOMAIN_LEASE_TEST
+	.check_running_as = lease_running_private,
+#endif
 	.sync_page_for_device = data_sync, .detach_as = detach_private,
 	.sync_page_for_cpu = data_return, .read_page = donated_read,
+	.read_command_page = private_data_read,
 	.flush_as = flush_private, .cache_barrier = drain_barrier,
 	.protected_mapping_summary = true
 };
@@ -2075,12 +2229,24 @@ static void task_retire_backend(unsigned long context, unsigned long group,
 		retire_expected_count = retire_clears = 0U;
 		track_launch = false;
 		track_retire = true; /* Any scrub of retained state is a regression. */
+		unsigned long budget_before[8], budget_after[8];
+		gpu_test_read_budget(budget_before);
 		mmio_reads = firmware_checks = shader_checks = 0U;
 		gpu_firmware_task_retire(&fw_ops, &donated_ops, &service, owner, token, &result);
 		track_retire = false;
 		assert(result.status == GPU_PRIVATE_SUCCESS && result.value[2] == 0U &&
 			!retire_clears && control_writes == control_before);
-		assert(mmio_reads == 75U && firmware_checks == 2U && shader_checks == 2U);
+		gpu_test_read_budget(budget_after);
+		if(plat_opencca_gpu_root_statistics)
+			assert((budget_before[3]==8UL || budget_before[3]==9UL) &&
+				budget_before[3]==budget_after[3]);
+		if(plat_opencca_gpu_as_statistics)
+			assert(budget_before[7]==9UL && budget_after[7]==9UL);
+		/* Original71=actual+omittedHI+2*absentSlots-extraFreshMaskReads. */
+		assert(mmio_reads + budget_after[1]-budget_before[1] +
+			2UL*(budget_after[5]-budget_before[5]) -
+			(budget_after[4]-budget_before[4]) == 71U &&
+			firmware_checks == 2U && shader_checks == 2U);
 		printf("GPU_RETIRE_BOUNDARY=PASS scenario=%u client=%u reads=%u config_checks=%u no scrub, fresh full check before release; MODEL_ONLY\n",
 			scenario, client, mmio_reads, shader_checks);
 		for (unsigned int q = 0U; q < resource.streams; q++) {
@@ -2093,7 +2259,7 @@ static void task_retire_backend(unsigned long context, unsigned long group,
 		/* A subsequent submission must RESUME, retaining monotonic ring IO
 		 * and leaving the old protected wrapper behind its consumer cursor.
 		 */
-		gpu_firmware_task_stage(&private_ops, &service, owner, group, 1UL, 0x100ff8UL, 16UL, 8UL, &result);
+		stage_one(&private_ops, &service, owner, group, 1UL, 0x100fc0UL, 72UL, 8UL, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS);
 		unsigned long next = result.value[0];
 
@@ -2222,7 +2388,7 @@ static void task_retire_backend(unsigned long context, unsigned long group,
 		unsigned long new_token;
 
 		/* Reuse the group, exact AS and CSG without a whole-device reset. */
-		gpu_firmware_task_stage(&private_ops, &service, owner, group, 1UL, 0x100ff8UL, 16UL, 8UL, &result);
+		stage_one(&private_ops, &service, owner, group, 1UL, 0x100fc0UL, 72UL, 8UL, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS && result.value[0] != token);
 		new_token = result.value[0];
 		gpu_firmware_task_prepare(&fw_ops, &donated_ops, &service, owner, context, group, new_token, &result);
@@ -2429,7 +2595,7 @@ static void task_reclaim_backend(unsigned long group,
 		gpu_firmware_group_inspect(&service, owner, group, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS && result.value[0] == GPU_FIRMWARE_GROUP_RESERVED);
 		/* Exact native state is reusable; the retired token cannot authorize it. */
-		gpu_firmware_task_stage(&private_ops, &service, owner, group, 1UL, 0x100ff8UL, 16UL, 8UL, &result);
+		stage_one(&private_ops, &service, owner, group, 1UL, 0x100fc0UL, 72UL, 8UL, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS && result.value[0] != token);
 		unsigned long next = result.value[0];
 
@@ -2603,7 +2769,8 @@ static void task_finish_backend(unsigned long context, unsigned long group,
 	if (test == 5U) fail_cpu_return = cpu_returns + 2U;
 	if (test >= 6U && test <= 8U) return_case = test == 8U ? 54U : test + 45U;
 	if (test == 42U) {
-		assert(alias_revoked && opencca_gpu_service_isolated(&service));
+		assert(alias_revoked &&
+		       opencca_gpu_service_isolated(&service, SERVICE_ENDPOINT));
 		assert(plat_opencca_gpu_pt_flush_live(words64(registers + at, 0U), as,
 			words64(registers + 0x2400U / 4U, 0U)));
 		unsigned int after_flush = writes;
@@ -2757,7 +2924,12 @@ static void task_drain_backend(unsigned long context, unsigned long group,
 	if (test == 11U) drain_barrier_failure = true;
 	if (test >= 12U && test <= 40U) live_flush_corruption = test - 11U;
 	if (test >= 41U && test <= 58U) drain_post_corruption = test - 40U;
+	if (test >= 62U && test <= 67U) {
+		drain_read_fault = (test - 62U) % 3U + 1U;
+		drain_reads_until_fault = test < 65U ? 3U : 6U;
+	}
 	gpu_firmware_task_drain(&fw_ops, &ops, &service, owner, token, &r);
+	assert(drain_read_fault == 0U); /* Each intended last-copy fault was exercised. */
 	assert(r.status == (success ? GPU_PRIVATE_SUCCESS : pending ? GPU_PRIVATE_INCOMPLETE : GPU_PRIVATE_STATE));
 	assert(cpu_returns == initial_returns && data_syncs == initial_data && control_writes == controls);
 	assert((model_groups[client].input[0] & 7U) == 1U); /* Never SUSPEND. */
@@ -2771,7 +2943,15 @@ static void task_drain_backend(unsigned long context, unsigned long group,
 		assert(writes == initial_writes && control_reads == initial_reads && drain_flushes == initial_flushes);
 	if (pending || (test >= 6U && test <= 8U))
 		assert(drain_flushes == initial_flushes);
+	if (test >= 62U && test <= 64U)
+		assert(drain_flushes == initial_flushes);
+	if (test >= 65U && test <= 67U)
+		assert(drain_flushes == initial_flushes + 1U);
 	if (success) {
+		/* One fresh STATUS snapshot and one post-flush snapshot; the first
+		 * snapshot's post-read root/configuration check is shared with flush.
+		 */
+		assert(control_reads - initial_reads == 6U);
 		assert(r.value[0] == 1UL && r.value[1] == 1UL && r.value[2] == 2UL && !r.value[3]);
 		assert(drain_flushes == initial_flushes + 1U && words64(registers + at, 0U) == root);
 		assert(gpu_private_task_live_eligible(&ops, &service, owner, context, token));
@@ -2959,6 +3139,7 @@ static void task_domain_adversarial(unsigned long context, unsigned long group,
 		{ .start = 0x100040UL, .bytes = 64U, .queue = 1U }
 	};
 	unsigned int scenario = domain_case;
+	domain_prepare_writes = 0U;
 	unsigned int as = model_groups[launch_csg].input[20];
 	unsigned int at = (0x2400U + as * 0x40U) / 4U;
 	unsigned long root = words64(registers + at, 0U);
@@ -3135,8 +3316,19 @@ static void task_domain_adversarial(unsigned long context, unsigned long group,
 	if (scenario == 3U || scenario == 4U) fail_control_write = control_writes + scenario - 2U;
 	if (scenario >= 5U && scenario <= 9U) domain_write_fault = scenario - 4U;
 	if (scenario >= 25U && scenario <= 45U) domain_write_fault = scenario - 19U;
-	/* Cross-call certificate reuse must reject corruption before writing a
-	 * successor, including roots changing after the last snapshot copy. */
+	/* These corruptions must reject handoff and publication. Bounded writes
+	 * to the exact unpublished ring slots may precede the fresh observation.
+	 * Derive the allowlist from the original protected mapping, not injected
+	 * register/input values. It excludes producer, output, sync and MMIO.
+	 */
+	uint64_t ring_va = words64(model_groups[launch_csg].cs_input[1], 4U);
+	unsigned int ring_bytes = model_groups[launch_csg].cs_input[1][6];
+	for (unsigned int i = 0U; i < 2U; i++) {
+		uint64_t off = (insert + i * 128U) & (ring_bytes - 1U);
+		domain_prepare_destinations[i] =
+			(software_leaf(root, ring_va + off) & UINT64_C(0x000000fffffff000)) + off % 4096U;
+	}
+
 	if (scenario >= 46U && scenario <= 63U) drain_corrupt_controls(scenario - 45U);
 	if (scenario >= 64U && scenario <= 66U) {
 		domain_read_fault = scenario - 63U;
@@ -3148,10 +3340,19 @@ static void task_domain_adversarial(unsigned long context, unsigned long group,
 	assert(!gpu_private_task_is_drained(&donated_ops, &stranger, owner, context, token));
 	assert(!gpu_private_task_is_drained(&donated_ops, &service, &stranger, context, token));
 	assert(!gpu_private_task_is_drained(&donated_ops, &service, owner, context, next));
+	unsigned int prepare_mmio = writes, prepare_bells = firmware_doorbells;
+	domain_prepare_writes = 0U;
+	domain_prepare_writing = true;
 	gpu_firmware_task_prepare_launch(&fw_ops, &donated_ops, &service, owner, context, group, next, &r);
+	domain_prepare_writing = false;
+	assert(writes == prepare_mmio && firmware_doorbells == prepare_bells);
+	assert(control_writes == prepare_controls + domain_prepare_writes);
 	if (scenario >= 25U) {
-		if (scenario >= 46U)
-			assert(control_writes == prepare_controls && drain_flushes == prepare_flushes);
+		if (scenario >= 46U) {
+			assert(drain_flushes == prepare_flushes);
+			if (scenario == 67U) assert(control_writes == prepare_controls);
+			else assert(domain_prepare_writes == 0U || domain_prepare_writes == 2U);
+		}
 		if (domain_write_fault != 0U || domain_read_fault != 0U)
 			fprintf(stderr, "DOMAIN_HANDOFF_INJECTION case=%u client=%u write=%u read=%u status=%lu\n",
 				scenario, client, domain_write_fault, domain_read_fault, r.status);
@@ -3204,9 +3405,16 @@ static void task_domain_adversarial(unsigned long context, unsigned long group,
 	done:
 	fail_control_write = domain_write_fault = domain_read_fault = domain_reads_until_fault = 0U;
 	assert(!cpu_returns);
+	printf("GPU_UNPUBLISHED_PREPARE case=%u client=%u ring_writes=%u\n",
+		scenario, client, domain_prepare_writes);
+
 	domain_active = false;
 	printf("GPU_TASK_DOMAIN_ADVERSARIAL=PASS case=%u client=%u old-token denial, readiness/lease retention and actual publication boundaries; MODEL_ONLY\n", scenario, client);
 }
+
+#ifdef GPU_DOMAIN_LEASE_TEST
+#include "opencca_gpu_domain_lease_test.h"
+#endif
 
 static void task_domain_backend(unsigned long context, unsigned long group,
 		unsigned long token, unsigned int client)
@@ -3218,6 +3426,10 @@ static void task_domain_backend(unsigned long context, unsigned long group,
 	unsigned int as = model_groups[launch_csg].input[20], at = (0x2400U + as * 0x40U) / 4U;
 	unsigned int kept = 0U, yielded = 0U;
 
+#ifdef GPU_DOMAIN_LEASE_TEST
+	task_domain_lease_backend(context, group, token, client);
+	return;
+#endif
 	if (domain_case != 1U) {
 		task_domain_adversarial(context, group, token, client);
 		return;
@@ -3250,7 +3462,7 @@ static void task_domain_backend(unsigned long context, unsigned long group,
 		assert(r.status == GPU_PRIVATE_INPUT && writes == rejected_writes);
 	}
 	waiter_command.pad = 0U;
-	for (unsigned int cycle = 0U; cycle < 96U; cycle++) {
+	for (unsigned int cycle = 0U; cycle < 384U; cycle++) {
 		unsigned int before = as_count, controls = control_writes;
 		gpu_firmware_task_finish_domain(&fw_ops, &donated_ops, &service, owner, token, &r);
 		if (r.status != GPU_PRIVATE_SUCCESS)
@@ -3348,7 +3560,7 @@ static void task_domain_backend(unsigned long context, unsigned long group,
 	/* Client 0 still competes with Client 1's running task. After Client 0
 	 * retires, Client 1 is alone even though the empty group still exists.
 	 */
-	assert(kept == (client == 0U ? 84U : 93U) && yielded == (client == 0U ? 12U : 3U));
+	assert(kept == (client == 0U ? 336U : (384U - 384U / GPU_TEST_SOLO_QUANTUM)) && yielded == (client == 0U ? 48U : (384U / GPU_TEST_SOLO_QUANTUM)));
 	gpu_firmware_task_stage_domain(&fw_ops, &donated_ops, &service, waiter_owner,
 		waiter_group, &waiter_command, 1U, GPU_PRIVATE_TASK_DEFERRED, &r);
 	assert(r.status == GPU_PRIVATE_SUCCESS);
@@ -3357,7 +3569,7 @@ static void task_domain_backend(unsigned long context, unsigned long group,
 
 	gpu_firmware_task_finish_domain(&fw_ops, &donated_ops, &service, owner, token, &r);
 	assert(r.status == GPU_PRIVATE_SUCCESS && as_count == before_waiter_finish + 3U &&
-		words64(registers + at, 0U) == 0UL); /* No 8/32-batch postponement. */
+		words64(registers + at, 0U) == 0UL); /* No 8/128-batch postponement. */
 	domain_old_token(owner, context, group, token);
 	gpu_firmware_task_cancel_staged(&donated_ops, waiter_owner, waiting_token, &r);
 	assert(r.status == GPU_PRIVATE_SUCCESS);
@@ -3370,7 +3582,7 @@ static void task_domain_backend(unsigned long context, unsigned long group,
 	gpu_firmware_group_inspect(&service, owner, group, &r);
 	assert(r.status == GPU_PRIVATE_SUCCESS && r.value[0] == GPU_FIRMWARE_GROUP_RESERVED);
 	domain_active = false;
-	printf("GPU_TASK_DOMAIN=PASS client=%u cycles=96 kept=%u forced_yield=%u quantum=solo32/shared8/waiter1, empty/rejected requests ignored, actual FINISH/Client READY/Proxy selection, monotonic ring wrap, frozen EXTRACT_INIT, old-token denial and trusted yield; MODEL_ONLY\n", client, kept, yielded);
+	printf("GPU_TASK_DOMAIN=PASS client=%u cycles=384 kept=%u forced_yield=%u quantum=selected-solo/shared8/waiter1, empty/rejected requests ignored, actual FINISH/Client READY/Proxy selection, monotonic ring wrap, frozen EXTRACT_INIT, old-token denial and trusted yield; MODEL_ONLY\n", client, kept, yielded);
 }
 
 #ifdef GPU_DOMAIN_RSI_TEST
@@ -3458,6 +3670,21 @@ static void task_complete_backend(unsigned long contexts[2], unsigned long group
 			assert(result.status == GPU_PRIVATE_STATE && writes == before + 1U &&
 				as_count == commands_before && complete_reads_this_call == 3U &&
 				(model_groups[i].input[0] & 7U) == 1U);
+			struct gpu_private_result history, replayed;
+			unsigned int reads_before = mmio_reads;
+
+			gpu_firmware_task_observation(&service, owners[i], tokens[i], &history);
+			assert(history.status == GPU_PRIVATE_SUCCESS && history.value[0] != 0UL &&
+				history.value[1] == 5UL && history.value[3] == tokens[i] &&
+				(history.value[2] & (GPU_PRIVATE_OBSERVATION_FAILED | GPU_PRIVATE_OBSERVATION_RMM_SOURCE)) ==
+				(GPU_PRIVATE_OBSERVATION_FAILED | GPU_PRIVATE_OBSERVATION_RMM_SOURCE));
+			gpu_firmware_task_progress(&fw_ops, &donated_ops, &service, owners[i], tokens[i], &replayed);
+			assert(replayed.status == GPU_PRIVATE_STATE && mmio_reads == reads_before);
+			gpu_firmware_task_observation(&service, owners[i], tokens[i], &replayed);
+			assert(replayed.status == GPU_PRIVATE_SUCCESS && replayed.value[0] == history.value[0] &&
+				replayed.value[1] == history.value[1] && replayed.value[2] == history.value[2]);
+			printf("GPU_TRUSTED_OBSERVATION=PASS case=%u client=%u attempts=%lu first_failure=%lu RMM_OBSERVATION_NOT_PHYSICAL_IRQ\n",
+				complete_boundary_case, i, history.value[0], history.value[1]);
 			printf("GPU_COMPLETE_STOP_FAULT=PASS case=%u client=%u rejected after read before SUSPEND/AS writes; MODEL_ONLY\n",
 				complete_boundary_case, i);
 		}
@@ -3480,7 +3707,7 @@ static void task_complete_backend(unsigned long contexts[2], unsigned long group
 			assert(result.value[0] == 1UL && result.value[1] == 1UL &&
 				result.value[2] == 0UL && result.value[3] == 0UL);
 			assert(as_count == commands_before + 3U && registers[at] == 0U && registers[at + 1U] == 0U);
-			assert(complete_reads_this_call == 4U && status_cleans == 2U && launch_cleans == 0U);
+			assert(complete_reads_this_call == 6U && status_cleans == 2U && launch_cleans == 0U);
 			if (i + 1U < count) {
 				unsigned int other_as = model_groups[i + 1U].input[20];
 
@@ -3735,18 +3962,18 @@ static void task_backend_integration(unsigned long root, unsigned long contexts[
 			sibling_group = result.value[0];
 			gpu_firmware_group_configure(&donated_ops, &service, &client_a, sibling_group, &q, 1UL, &result);
 			assert(result.status == GPU_PRIVATE_SUCCESS);
-			gpu_firmware_task_stage(&private_ops, &service, &client_a, sibling_group, 0UL, 0x100000UL, 8UL, 0UL, &result);
+			stage_one(&private_ops, &service, &client_a, sibling_group, 0UL, 0x100000UL, 8UL, 0UL, &result);
 			assert(result.status == GPU_PRIVATE_SUCCESS);
 			sibling_token = result.value[0];
 		}
 		if (scenario == 65U) {
-			gpu_firmware_task_stage(&private_ops, &service, owners[i], groups[i], 0UL,
+			stage_one(&private_ops, &service, owners[i], groups[i], 0UL,
 				0x100000UL, 8UL, 0UL, &result);
 			assert(result.status == GPU_PRIVATE_SUCCESS);
 			prepared_unpublished_task = result.value[0];
 		}
-		gpu_firmware_task_stage(&private_ops, &service, owners[i], groups[i], 1UL,
-			0x100ff8UL, 16UL, 7UL, &result);
+		stage_one(&private_ops, &service, owners[i], groups[i], 1UL,
+			0x100fc0UL, 72UL, 7UL, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS);
 		tokens[i] = result.value[0];
 		last_prepared_task = tokens[0];
@@ -3774,6 +4001,8 @@ static void task_backend_integration(unsigned long root, unsigned long contexts[
 		registers[0x2440U / 4U] = 0xdead000U;
 	if (scenario == 10U)
 		registers[0x18U / 4U] &= ~2U;
+	unsigned int endpoint_priorities = 0U;
+
 	for (unsigned int i = 0U; i < count; i++) {
 		gpu_firmware_task_prepare(&fw_ops, &donated_ops, &service, owners[i],
 			contexts[i], groups[i], tokens[i], &result);
@@ -3828,7 +4057,14 @@ static void task_backend_integration(unsigned long root, unsigned long contexts[
 
 		assert(csg[0] == 0U && csg[1] == 0U && csg[2] == 0U && csg[3] == 0U);
 		assert(words64(csg, 8U) == UINT64_C(0x10000000f) && words64(csg, 10U) == UINT64_C(0x10000000f));
-		assert(csg[12] == 1U && csg[13] == (5U | (5U << 8U) | (1U << 16U)));
+		assert(csg[12] == 1U && (csg[13] & 0x0fffffffU) == (5U | (5U << 8U) | (1U << 16U)));
+		/* Concurrent groups requesting the same engines must have distinct
+		 * four-bit FW priorities, while their endpoint limits stay intact.
+		 */
+		unsigned int endpoint_priority = csg[13] >> 28U;
+
+		assert((endpoint_priorities & (1U << endpoint_priority)) == 0U);
+		endpoint_priorities |= 1U << endpoint_priority;
 		assert(words64(csg, 16U) == resources[i].suspend_va && words64(csg, 18U) == 0UL && csg[20] == as && csg[21] == 0U);
 		assert(client_root != 0UL && client_root != root);
 		quiesce_sync_pa[i] = software_leaf(client_root, resources[i].sync_va) & UINT64_C(0x000000fffffff000);
@@ -4202,8 +4438,8 @@ static void task_heap_backend(unsigned long root, unsigned long contexts[2], uns
 			gpu_firmware_group_configure(&donated_ops, &service, &client_a, heap_group_handle, &config, 1UL, &r);
 			assert(r.status == GPU_PRIVATE_SUCCESS);
 		}
-		gpu_firmware_task_stage(&private_ops, &service, &client_a, heap_group_handle,
-			queue, 0x100ff8UL, 16UL, 8UL, &r);
+		stage_one(&private_ops, &service, &client_a, heap_group_handle,
+			queue, 0x100fc0UL, 72UL, 8UL, &r);
 		assert(r.status == GPU_PRIVATE_SUCCESS);
 		unsigned long next = r.value[0];
 
@@ -4386,13 +4622,15 @@ static void suspend_observe_backend(unsigned long context, unsigned long group,
 {
 	struct gpu_private_result result;
 	unsigned int test = suspend_observe_case, before = firmware_doorbells, cpu_before = cpu_returns;
+	unsigned int stopped_before = suspend_count;
 	uint32_t other_as[16];
 
 	memcpy(other_as, registers + 0x2480U / 4U, sizeof(other_as));
 	memset(returned_data, 0, sizeof(returned_data));
 	suspend_observe_active = true;
-	/* Simulate actual GPU work reaching terminal records BEFORE the API call.
-	 * Old START stream snapshots intentionally still claim busy until SUSPEND.
+	/* Terminal hints precede a fresh STATUS. Even with exact terminal values,
+	 * busy/deferred STATUS must leave the task running and retain its pages.
+	 * A later SUSPEND may report DEFERRED again after an idle STATUS.
 	 */
 	for (unsigned int q = 0U; q < 2U; q++) {
 		uint64_t *in = (void *)(uintptr_t)batch_io[q][0];
@@ -4415,13 +4653,23 @@ static void suspend_observe_backend(unsigned long context, unsigned long group,
 		assert(firmware_doorbells == before + 2U); /* Public COMPLETE still STATUS+SUSPEND. */
 	}
 	gpu_firmware_task_finish(&fw_ops, ops, &service, &client_a, token, &result);
-	bool success = test <= 3U || test == 20U;
+	bool success = test <= 5U || test == 20U;
 
+	if (test == 4U || test == 5U) {
+		assert(result.status == GPU_PRIVATE_INCOMPLETE && cpu_returns == cpu_before);
+		assert(firmware_doorbells == before + 1U && suspend_count == stopped_before);
+		gpu_private_unmap(&private_ops, &client_a, context, 0x100000UL, 2UL, &result);
+		assert(result.status == GPU_PRIVATE_STATE);
+		/* The next genuine STATUS becomes idle; no stop/replay occurred. */
+		suspend_observe_case = 1U;
+		batch_cleans = batch_cs_cleans = 0U;
+		gpu_firmware_task_finish(&fw_ops, ops, &service, &client_a, token, &result);
+	}
 	assert(result.status == (success ? GPU_PRIVATE_SUCCESS : GPU_PRIVATE_STATE));
 	assert(memcmp(other_as, registers + 0x2480U / 4U, sizeof(other_as)) == 0);
 	if (success) {
 		assert(result.value[0] == 1UL && cpu_returns == cpu_before + 2U);
-		assert(firmware_doorbells == before + (test == 2U || test == 3U || test == 20U ? 2U : 1U));
+		assert(firmware_doorbells == before + (test == 4U || test == 5U ? 3U : 2U));
 		gpu_firmware_task_finish(&fw_ops, ops, &service, &client_a, token, &result);
 		assert(result.status == GPU_PRIVATE_INPUT);
 		gpu_private_unmap(&private_ops, &client_a, context, 0x100000UL, 2UL, &result);
@@ -4437,7 +4685,7 @@ static void suspend_observe_backend(unsigned long context, unsigned long group,
 		assert(result.status == GPU_PRIVATE_STATE);
 	}
 	suspend_observe_active = false;
-	printf("GPU_SUSPEND_OBSERVE=PASS case=%u success=%u doors=%u current SUSPEND snapshot, real AS disable, postread check, CPU return and retirement, other Client AS unchanged; MODEL_ONLY\n",
+	printf("GPU_SUSPEND_OBSERVE=PASS case=%u success=%u doors=%u fresh live STATUS before SUSPEND, deferred stopped snapshot, real AS disable, postread check, CPU return and retirement, other Client AS unchanged; MODEL_ONLY\n",
 		test, success ? 1U : 0U, firmware_doorbells - before);
 }
 
@@ -5294,11 +5542,17 @@ static void firmware_integration(const char *path)
 	assert(opencca_gpu_pm_destroy_begin(&service));
 	opencca_gpu_mmio_release(&service);
 	initialize();
-	assert(opencca_gpu_mmio_grant(&service) && opencca_gpu_claim(&service));
-	assert(opencca_gpu_service_isolate(&device_ops, &service));
+	assert(opencca_gpu_mmio_grant(&service) &&
+	       opencca_gpu_claim(&service, SERVICE_ENDPOINT));
+	assert(opencca_gpu_service_isolate(&device_ops, &service,
+					    SERVICE_ENDPOINT));
 	gpu_private_device_revoked(&private_ops);
 	gpu_firmware_device_revoked();
-	for (unsigned int phase = domain_dispatch_only ? 465U : 0U; phase < 545U; phase++) {
+	for (unsigned int phase = domain_dispatch_only ? 465U : 0U; phase < 551U; phase++) {
+#ifdef GPU_DOMAIN_LEASE_TEST
+		/* Keep the final real RELEASE fixture; PM teardown depends on it. */
+		if (phase != 465U && phase != 550U) continue;
+#endif
 		/* RELEASE ends the service instance, so its partial-boot case is last. */
 		retire_boundary_case = phase >= 192U && phase < 214U ? phase - 191U : 0U;
 		complete_boundary_case = phase >= 214U && phase < 229U ? phase - 213U : 0U;
@@ -5313,12 +5567,14 @@ static void firmware_integration(const char *path)
 		suspend_observe_case = phase >= 350U && phase < 374U ? phase - 349U : 0U;
 		resume_accept_case = phase >= 334U && phase < 350U ? phase - 333U : suspend_observe_case ? 1U : 0U;
 		drain_case = phase >= 404U && phase < 465U ? phase - 403U : 0U;
+		if (phase >= 544U && phase < 550U) drain_case = phase - 482U;
 		domain_case = phase >= 465U && phase < 532U ? phase - 464U : 0U;
 		domain_active = false; domain_write_fault = domain_read_fault = domain_reads_until_fault = 0U;
 		drain_flushes = drain_post_corruption = 0U;
+		drain_read_fault = drain_reads_until_fault = 0U;
 		drain_barrier_failure = false; drain_fault = NULL;
 		memset(nc_data_visibility, 0, sizeof(nc_data_visibility));
-		unsigned int failure = phase == 544U ? 2U : dispatch_case ? 130U : domain_case || drain_case ? 66U : resume_accept_case ? 180U : finish_case != 0U ? (finish_case == 3U ? 70U : finish_case == 4U ? 81U : 66U) : ready_launch_case != 0U ? 130U : fatal_snapshot_case ? 31U : ready_publish_case != 0U ? 130U : reclaim_case != 0U || complete_boundary_case != 0U ? 66U : retire_boundary_case != 0U ?
+		unsigned int failure = phase == 550U ? 2U : dispatch_case ? 130U : domain_case || drain_case ? 66U : resume_accept_case ? 180U : finish_case != 0U ? (finish_case == 3U ? 70U : finish_case == 4U ? 81U : 66U) : ready_launch_case != 0U ? 130U : fatal_snapshot_case ? 31U : ready_publish_case != 0U ? 130U : reclaim_case != 0U || complete_boundary_case != 0U ? 66U : retire_boundary_case != 0U ?
 			(retire_boundary_case <= 18U ? 66U : 60U) :
 			phase >= 175U ? phase + 2U : phase >= 2U ? phase + 1U : phase;
 
@@ -5413,7 +5669,8 @@ static void firmware_integration(const char *path)
 				assert(result.value[0] == GPU_FIRMWARE_QUARANTINED);
 			}
 			assert(opencca_gpu_control(&device_ops, NULL, OPENCCA_GPU_RESET, 0UL, 0UL));
-			assert(opencca_gpu_service_isolated(&service));
+			assert(opencca_gpu_service_isolated(&service,
+							   SERVICE_ENDPOINT));
 		} else {
 			assert(result.status == GPU_PRIVATE_STATE && firmware_starts == 0U);
 			gpu_firmware_inspect(&service, &result);

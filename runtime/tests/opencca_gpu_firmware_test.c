@@ -7,6 +7,20 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A one-command test case uses the same batch admission as production. */
+static void stage_one(const struct gpu_private_ops *ops, const void *service,
+        const void *owner, unsigned long group, uint32_t queue,
+        unsigned long start, uint32_t bytes, uint32_t flush,
+        struct gpu_private_result *result)
+{
+    const struct gpu_firmware_task_command command = {
+        .start = start, .bytes = bytes, .queue = queue, .latest_flush = flush
+    };
+    gpu_firmware_task_stage_batch(ops, service, owner, group, &command, 1U, 0UL, result);
+}
+
+static bool deny_adversary_commands(const unsigned char *page, size_t bytes);
+
 static unsigned char service, attacker;
 static unsigned char client_a, client_b;
 static unsigned char quota_clients[3];
@@ -36,8 +50,23 @@ static unsigned long latest_private_table;
 static unsigned int fault_after_leaf_writes;
 static bool fail_table_lookup;
 static unsigned char client_commands[2][4096] __attribute__((aligned(4096)));
+static bool permission_gate_enabled;
 static unsigned long stale_task;
 static unsigned long retained_task_bo;
+
+static void stage_one_with_permission_gate(const struct gpu_private_ops *ops,
+        const void *service, const void *owner, unsigned long group, uint32_t queue,
+        unsigned long start, uint32_t bytes, uint32_t flush,
+        struct gpu_private_result *result)
+{
+    memset(result, 0, sizeof(*result));
+    if (permission_gate_enabled && bytes >= 24U &&
+        deny_adversary_commands(client_commands[0], (size_t)bytes)) {
+        result->status = GPU_PRIVATE_INPUT;
+        return;
+    }
+    stage_one(ops, service, owner, group, queue, start, bytes, flush, result);
+}
 
 #define ADDRESS_MASK UINT64_C(0x000000fffffff000)
 
@@ -396,6 +425,28 @@ static bool command_source(const void *owner, unsigned long ipa, unsigned long *
 	return true;
 }
 
+static bool command_read(unsigned long pa, size_t offset, void *data, size_t bytes)
+{
+	for (unsigned int page = 0U; page < 2U; page++) {
+		if (pa == (uintptr_t)client_commands[page] && offset <= 4096U &&
+		    bytes <= 4096U - offset) {
+			memcpy(data, client_commands[page] + offset, bytes);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool deny_adversary_commands(const unsigned char *page, size_t bytes)
+{
+	const uint64_t *instructions = (const void *)page;
+
+	return page == client_commands[0] && bytes >= 48U &&
+		(instructions[1] >> 56U) == 0x7fU &&
+		(instructions[3] >> 56U) == 0x7eU &&
+		(instructions[5] >> 56U) == 0x7dU;
+}
+
 static void staged_tasks(unsigned long context, unsigned long group, unsigned long other,
 		const struct gpu_firmware_group_resources *group_resources, unsigned long root)
 {
@@ -407,6 +458,7 @@ static void staged_tasks(unsigned long context, unsigned long group, unsigned lo
 	unsigned int old_notifications = notifications;
 
 	memory_ops.source_page = command_source;
+	memory_ops.read_page = command_read; memory_ops.read_command_page = command_read;
 	gpu_firmware_task_cancel(&client_a, stale_task, &result);
 	assert(result.status == GPU_PRIVATE_INPUT);
 	gpu_private_bo_create(&client_a, &service, sizeof(client_commands), GPU_PRIVATE_READ, &result);
@@ -417,10 +469,58 @@ static void staged_tasks(unsigned long context, unsigned long group, unsigned lo
 	gpu_private_map(&memory_ops, &client_a, context, object, 0UL, 0x100000UL, 1U, GPU_PRIVATE_READ, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
 	/* A missing second page fails before taking a hold: mapping it still works. */
-	gpu_firmware_task_stage(&memory_ops, &service, &client_a, group, 0UL, 0x100ff8UL, 16UL, 7UL, &result);
+	stage_one(&memory_ops, &service, &client_a, group, 0UL, 0x100fc0UL, 72UL, 7UL, &result);
 	assert(result.status == GPU_PRIVATE_STATE);
 	gpu_private_map(&memory_ops, &client_a, context, object, 4096UL, 0x101000UL, 1U, GPU_PRIVATE_READ, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
+	/*
+	 * M07 command-content oracle: every called instruction is decoded at its
+	 * architecture-v10 opcode position. Defined Client opcodes remain usable,
+	 * while undefined privileged/physical/MCU markers are rejected before a
+	 * mapping hold or task publication.
+	 */
+	memset(client_commands[0], 0, sizeof(client_commands[0]));
+	((uint64_t *)client_commands[0])[1] = UINT64_C(9) << 56U;
+	stage_one(&memory_ops, &service, &client_a, group, 0UL,
+		0x100000UL, 24U, 7UL, &result);
+	assert(result.status == GPU_PRIVATE_SUCCESS);
+	token = result.value[0];
+	struct gpu_private_result observation;
+
+	gpu_firmware_task_observation(&service, &client_a, token, &observation);
+	assert(observation.status == GPU_PRIVATE_SUCCESS && observation.value[0] == 0UL &&
+		observation.value[1] == 0UL && observation.value[2] == 0UL && observation.value[3] == token);
+	gpu_firmware_task_observation(&service, &client_b, token, &observation);
+	assert(observation.status == GPU_PRIVATE_INPUT && observation.value[3] == 0UL);
+	gpu_firmware_task_cancel(&client_a, token, &result);
+	assert(result.status == GPU_PRIVATE_SUCCESS);
+	gpu_firmware_task_observation(&service, &client_a, token, &observation);
+	assert(observation.status == GPU_PRIVATE_INPUT && observation.value[3] == 0UL);
+	puts("GPU_COMMAND_FINISH_TILING=PASS actual admission accepts architecture-v10 opcode 9");
+	((uint64_t *)client_commands[0])[0] = UINT64_C(0);
+	((uint64_t *)client_commands[0])[1] = UINT64_C(0x7f) << 56U;
+	((uint64_t *)client_commands[0])[2] = UINT64_C(1) << 56U;
+	((uint64_t *)client_commands[0])[3] = UINT64_C(0x7e) << 56U;
+	((uint64_t *)client_commands[0])[4] = UINT64_C(3) << 56U;
+	((uint64_t *)client_commands[0])[5] = UINT64_C(0x7d) << 56U;
+	stage_one(&memory_ops, &service, &client_a, group, 0UL,
+		0x100000UL, 48U, 7UL, &result);
+	assert(result.status != GPU_PRIVATE_SUCCESS && result.value[0] == 0UL);
+	permission_gate_enabled = true;
+	stage_one_with_permission_gate(&memory_ops, &service, &client_a, group, 0UL,
+		0x100000UL, 48U, 7UL, &result);
+	permission_gate_enabled = false;
+	assert(result.status != GPU_PRIVATE_SUCCESS);
+	memset(client_commands[0], 0, sizeof(client_commands[0]));
+	((uint64_t *)client_commands[1])[0] = UINT64_C(0x7f) << 56U;
+	struct gpu_firmware_task_command bad_opcode[2] = {
+		{ .start = 0x100000UL, .bytes = 8U, .queue = 0U },
+		{ .start = 0x101000UL, .bytes = 8U, .queue = 1U }
+	};
+	gpu_firmware_task_stage_batch(&memory_ops, &service, &client_a,
+		group, bad_opcode, 2U, 0UL, &result);
+	assert(result.status != GPU_PRIVATE_SUCCESS && result.value[0] == 0UL);
+	memset(client_commands[1], 0, sizeof(client_commands[1]));
 	/* Batch admission is atomic: a bad later member must not leak a hold. */
 	struct gpu_firmware_task_command commands[GPU_PRIVATE_TASK_BATCH] = {
 		{ .start = 0x100000UL, .bytes = 8U, .queue = 1U },
@@ -478,34 +578,34 @@ static void staged_tasks(unsigned long context, unsigned long group, unsigned lo
 	gpu_firmware_task_cancel(&client_a, batch, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
 	puts("GPU_TASK_BATCH_ADMISSION=PASS actual Client, array bounds, alignment, fence-only, private command backing, atomic rejection, aggregate walk bound, one mapping hold; MODEL_ONLY");
-	for (unsigned int i = 0U; i < 9U; i++) {
+	for (unsigned int i = 0U; i < 8U; i++) {
 		const void *owner = i == 0U ? &client_b : &client_a;
 		const void *service_rd = i == 1U ? &attacker : &service;
 		unsigned long queue = i == 2U ? 2UL : 0UL;
 		unsigned long start = i == 3U ? group_resources->ring_va[0] :
 			i == 4U ? 0x100001UL : i == 5U ? 0x300000UL : 0x100000UL;
 		unsigned long bytes = i == 6U ? 0UL : i == 7U ? 7UL : 8UL;
-		unsigned long flush = i == 8U ? 1UL << 32U : 0UL;
+		uint32_t flush = 0U;
 
-		gpu_firmware_task_stage(&memory_ops, service_rd, owner, group, queue, start, bytes, flush, &result);
+		stage_one(&memory_ops, service_rd, owner, group, queue, start, bytes, flush, &result);
 		assert(result.status != GPU_PRIVATE_SUCCESS && result.value[0] == 0UL);
 	}
 	assert(!gpu_private_task_hold(&memory_ops, &service, &client_a, context,
 		0x100000UL, (GPU_PRIVATE_BATCH + 1UL) * 4096UL));
-	gpu_firmware_task_stage(&memory_ops, &service, &client_a, group, 1UL, 0x100ff8UL, 16UL, 7UL, &result);
+	stage_one(&memory_ops, &service, &client_a, group, 1UL, 0x100fc0UL, 72UL, 7UL, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS && result.value[1] == 1UL);
 	token = result.value[0];
 	assert(gpu_firmware_task_resources(&service, &client_a, token, &resources));
 	assert(resources.group == group && resources.context == context && resources.queue == 1U &&
-		resources.bytes == 16U && resources.latest_flush == 7U);
+		resources.bytes == 72U && resources.latest_flush == 7U);
 	saved = resources;
 	/* Actual native command encoding, including correct per-queue sync offset. */
 	uint64_t sync = group_resources->sync_va + 16U;
 	const uint64_t expected[GPU_FIRMWARE_TASK_INSTRUCTIONS] = {
 		(UINT64_C(2) << 56U) | (UINT64_C(94) << 48U) | 7U,
 		(UINT64_C(36) << 56U) | (UINT64_C(94) << 40U) | 0x233U,
-		(UINT64_C(1) << 56U) | (UINT64_C(92) << 48U) | 0x100ff8U,
-		(UINT64_C(2) << 56U) | (UINT64_C(94) << 48U) | 16U,
+		(UINT64_C(1) << 56U) | (UINT64_C(92) << 48U) | 0x100fc0U,
+		(UINT64_C(2) << 56U) | (UINT64_C(94) << 48U) | 72U,
 		(UINT64_C(3) << 56U) | (UINT64_C(1) << 16U),
 		(UINT64_C(32) << 56U) | (UINT64_C(92) << 40U) | (UINT64_C(94) << 32U),
 		(UINT64_C(1) << 56U) | (UINT64_C(92) << 48U) | sync,
@@ -523,7 +623,7 @@ static void staged_tasks(unsigned long context, unsigned long group, unsigned lo
 		assert(((unsigned char *)&resources)[i] == 0U);
 	gpu_firmware_task_validate(&service, &client_a, context, group, token, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS && result.value[0] == 1UL &&
-		result.value[1] == 16UL && result.value[2] == 7UL && result.value[3] == 0UL);
+		result.value[1] == 72UL && result.value[2] == 7UL && result.value[3] == 0UL);
 	gpu_firmware_task_validate(&attacker, &client_a, context, group, token, &result);
 	assert(result.status == GPU_PRIVATE_INPUT);
 	gpu_firmware_task_validate(&service, &client_a, context + 1UL, group, token, &result);
@@ -549,11 +649,11 @@ static void staged_tasks(unsigned long context, unsigned long group, unsigned lo
 	assert(result.status == GPU_PRIVATE_SUCCESS); /* Refused destroy did not close group. */
 	tokens[0] = token;
 	for (unsigned int i = 1U; i < GPU_FIRMWARE_CLIENT_TASKS; i++) {
-		gpu_firmware_task_stage(&memory_ops, &service, &client_a, group, 0UL, 0x100000UL, 8UL, i, &result);
+		stage_one(&memory_ops, &service, &client_a, group, 0UL, 0x100000UL, 8UL, i, &result);
 		assert(result.status == GPU_PRIVATE_SUCCESS);
 		tokens[i] = result.value[0];
 	}
-	gpu_firmware_task_stage(&memory_ops, &service, &client_a, group, 0UL, 0x100000UL, 8UL, 0UL, &result);
+	stage_one(&memory_ops, &service, &client_a, group, 0UL, 0x100000UL, 8UL, 0UL, &result);
 	assert(result.status == GPU_PRIVATE_FULL);
 	for (unsigned int i = 0U; i < GPU_FIRMWARE_CLIENT_TASKS; i++) {
 		gpu_firmware_task_cancel(&client_a, tokens[i], &result);
@@ -606,8 +706,25 @@ static void group_reservations(unsigned long contexts[2])
 	assert(result.status == GPU_PRIVATE_INPUT); /* Cannot borrow another context. */
 	gpu_firmware_group_create(&ops, &arena_ops, &service, &client_a, contexts[0], 0UL, &result);
 	assert(result.status == GPU_PRIVATE_INPUT);
-	gpu_firmware_group_create(&ops, &arena_ops, &service, &client_a, contexts[0], 9UL, &result);
-	assert(result.status == GPU_PRIVATE_STATE); /* Pinned model reports eight streams. */
+	gpu_firmware_properties(&service, 1UL, &result);
+	assert(result.status == GPU_PRIVATE_SUCCESS && result.value[0] != 0UL &&
+		result.value[0] <= GPU_FIRMWARE_STREAMS);
+	const unsigned long advertised_streams = result.value[0];
+	for (unsigned int i = 0U; i < 5U; i++) {
+		const unsigned long requested[] = {
+			0UL, advertised_streams, advertised_streams + 1UL,
+			GPU_FIRMWARE_STREAMS + 1UL, ULONG_MAX
+		};
+
+		gpu_firmware_group_create(&ops, &arena_ops, &service, &client_a,
+			contexts[0], requested[i], &result);
+		assert(result.status == (i == 0U || i >= 3U) ? GPU_PRIVATE_INPUT :
+			(i == 1U ? GPU_PRIVATE_SUCCESS : GPU_PRIVATE_STATE));
+		if (i != 1U)
+			continue;
+		assert(result.value[1] == advertised_streams);
+		destroy_group(&client_a, result.value[0], false);
+	}
 	config_succeeds = false;
 	gpu_firmware_group_create(&ops, &arena_ops, &service, &client_a, contexts[0], 1UL, &result);
 	assert(result.status == GPU_PRIVATE_STATE);
@@ -875,6 +992,7 @@ static void group_reservations(unsigned long contexts[2])
 	unsigned long command_ipa = 0x40000000UL;
 
 	command_ops.source_page = command_source;
+	command_ops.read_page = command_read; command_ops.read_command_page = command_read;
 	gpu_private_bo_create(&client_a, &service, 4096UL, GPU_PRIVATE_READ, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
 	retained_task_bo = result.value[0];
@@ -883,7 +1001,7 @@ static void group_reservations(unsigned long contexts[2])
 	gpu_private_map(&command_ops, &client_a, contexts[0], retained_task_bo, 0UL, 0x100000UL, 1U,
 		GPU_PRIVATE_READ, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
-	gpu_firmware_task_stage(&command_ops, &service, &client_a, stale_group, 0UL, 0x100000UL, 8UL, 0UL, &result);
+	stage_one(&command_ops, &service, &client_a, stale_group, 0UL, 0x100000UL, 8UL, 0UL, &result);
 	assert(result.status == GPU_PRIVATE_SUCCESS);
 	stale_task = result.value[0]; /* Verify cancellation cannot retire an active root. */
 	active_ops.activate = context_activate_model;
@@ -1153,6 +1271,7 @@ int main(int argc, char **argv)
 	gpu_firmware_write(&service, 0UL, original, 4096U, &result);
 	assert(result.status == GPU_PRIVATE_STATE); /* No replay or overwrite. */
 	begin(); /* Interrupted upload can be restarted by its authenticated service. */
+	puts("GPU_FIRMWARE_FRAGMENT=PASS exact total, bounded chunk, sequential offset, duplicate/out-of-order rejection and incomplete seal; MODEL_ONLY");
 	memcpy(supplied, original, sizeof(supplied));
 	upload();
 	memset(supplied, 0x55, sizeof(supplied)); /* Source mutation after copy. */
@@ -1201,6 +1320,8 @@ int main(int argc, char **argv)
 	protected_arena(0x40000U);
 	protected_arena(0x210000U); /* Multi-batch group retirement with real large extents. */
 	puts("GPU_FIRMWARE_SNAPSHOT=PASS pinned SHA256, real CSF metadata, private copy, owner binding, ordered upload, no post-seal overwrite, tamper and crypto failure rejection, trusted retirement");
+	puts("GPU_COMMAND_PERMISSION=PASS actual admission decoded every 8-byte Client instruction and rejected undefined privileged/physical/MCU opcode markers before publication; SCOPED_L2");
+	puts("GPU_COMMAND_PERMISSION_CONTROL=PASS independent pre-admission gate rejected the same adversarial stream before task publication");
 	puts("GPU_FIRMWARE_BOOT=MODEL_ONLY GPU_PRIVATE_EXECUTION=NOT_IMPLEMENTED");
 	return 0;
 }

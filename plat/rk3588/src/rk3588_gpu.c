@@ -71,16 +71,35 @@
 
 static uint32_t reg_read(unsigned long offset)
 {
-	return read32((volatile void *)(uintptr_t)(OPENCCA_GPU_MMIO_BASE + offset));
+	return read32(
+		(volatile void *)(uintptr_t)(OPENCCA_GPU_MMIO_BASE + offset));
+}
+
+bool plat_opencca_gpu_irq_idle(uint32_t expected_gpu, uint32_t expected_job,
+			       uint32_t expected_mmu)
+{
+	/* Every read is current device MMIO, never a remembered mask state.
+	 * This helper performs no writes and cannot consume or clear an event.
+	 */
+	uint32_t gpu = reg_read(GPU_INT_RAWSTAT);
+	uint32_t job = reg_read(JOB_INT_RAWSTAT);
+	uint32_t mmu = reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK;
+	uint32_t gpu_mask = reg_read(GPU_INT_MASK);
+	uint32_t job_mask = reg_read(JOB_INT_MASK);
+	uint32_t mmu_mask = reg_read(MMU_INT_MASK);
+
+	return (gpu | job | mmu) == 0U && gpu_mask == expected_gpu &&
+	       job_mask == expected_job && mmu_mask == expected_mmu;
 }
 
 static void reg_write(unsigned long offset, uint32_t value)
 {
-	write32(value, (volatile void *)(uintptr_t)(OPENCCA_GPU_MMIO_BASE + offset));
+	write32(value,
+		(volatile void *)(uintptr_t)(OPENCCA_GPU_MMIO_BASE + offset));
 }
 
 static bool poll_timeout(unsigned long offset, uint32_t mask, uint32_t expected,
-		unsigned long microseconds)
+			 unsigned long microseconds)
 {
 	unsigned long start = read_cntpct_el0();
 	unsigned long ticks = read_cntfrq_el0() / 1000000UL * microseconds;
@@ -122,14 +141,90 @@ static bool private_pt_format(unsigned long root)
 
 static bool private_pt_ready(unsigned long root)
 {
-	return private_pt_format(root) && reg_read(MCU_CONTROL) == 0U && reg_read(MCU_STATUS) == 0U &&
-		(reg_read(GPU_STATUS) & GPU_ACTIVE) == 0U;
+	return private_pt_format(root) && reg_read(MCU_CONTROL) == 0U &&
+	       reg_read(MCU_STATUS) == 0U &&
+	       (reg_read(GPU_STATUS) & GPU_ACTIVE) == 0U;
 }
 
 static unsigned long private_pt_root(unsigned int slot)
 {
 	return reg_read(AS_TRANSTAB_LO(slot)) |
-		((unsigned long)reg_read(AS_TRANSTAB_HI(slot)) << 32U);
+	       ((unsigned long)reg_read(AS_TRANSTAB_HI(slot)) << 32U);
+}
+
+/* Exact equality of the same current LO/HI root fields. If LO differs,
+ * no value of HI can make this slot alias the protected root. Keep the actual
+ * HI read whenever LO matches, including roots whose low word is zero. This
+ * caches no root/slot fact and never reduces the set of slots being checked.
+ */
+static unsigned long root_comparisons, root_low_misses, root_high_reads;
+static bool root_statistics_overflow;
+static unsigned long alias_mask_reads, alias_absent_slots;
+static uint32_t alias_last_mask;
+static void root_stat_increment(unsigned long *value)
+{
+	if (*value != ~0UL)
+		(*value)++;
+	else
+		root_statistics_overflow = true;
+}
+
+static bool private_pt_root_matches(unsigned int slot, unsigned long root)
+{
+	uint32_t low = reg_read(AS_TRANSTAB_LO(slot));
+	root_stat_increment(&root_comparisons);
+	if (low != (uint32_t)root) {
+		root_stat_increment(&root_low_misses);
+		return false;
+	}
+	root_stat_increment(&root_high_reads);
+	return reg_read(AS_TRANSTAB_HI(slot)) == (uint32_t)(root >> 32U);
+}
+
+void plat_opencca_gpu_root_statistics(unsigned long values[4])
+{
+	values[0] = root_comparisons;
+	values[1] = root_low_misses;
+	values[2] = root_high_reads;
+	values[3] = root_statistics_overflow ? 0UL : 9UL;
+}
+
+/* AS_PRESENT is the device's implemented-AS mask, already used by the
+ * existing PT-sync path and actual slot-admission checks. Read it again on
+ * EACH side of a flush/extension. No cached capability or fixed eight-slot
+ * assumption is used; every implemented nonzero AS remains in the scan.
+ */
+static bool private_pt_no_aliases(unsigned int slot, unsigned long root)
+{
+	uint32_t present;
+
+	if (slot == 0U || slot >= GPU_AS_COUNT || root == 0UL)
+		return false;
+	present = reg_read(GPU_AS_PRESENT);
+	root_stat_increment(&alias_mask_reads);
+	alias_last_mask = present;
+	if ((present & ((1U << slot) | 1U)) != ((1U << slot) | 1U) ||
+	    (present >> GPU_AS_COUNT) != 0U)
+		return false;
+	for (unsigned int other = 1U; other < GPU_AS_COUNT; other++) {
+		if (other == slot)
+			continue;
+		if ((present & (1U << other)) == 0U) {
+			root_stat_increment(&alias_absent_slots);
+			continue;
+		}
+		if (private_pt_root_matches(other, root))
+			return false;
+	}
+	return true;
+}
+
+void plat_opencca_gpu_as_statistics(unsigned long values[4])
+{
+	values[0] = alias_mask_reads;
+	values[1] = alias_absent_slots;
+	values[2] = alias_last_mask;
+	values[3] = root_statistics_overflow ? 0UL : 9UL;
 }
 
 static bool private_pt_command(unsigned int slot, uint32_t command)
@@ -146,7 +241,8 @@ static bool private_pt_flush(unsigned int slot, uint32_t command)
 	/* The whole 48-bit VA range, encoded as log2(size)-1 at address zero. */
 	reg_write(AS_LOCKADDR_LO(slot), 47U);
 	reg_write(AS_LOCKADDR_HI(slot), 0U);
-	return private_pt_command(slot, AS_LOCK) && private_pt_command(slot, command);
+	return private_pt_command(slot, AS_LOCK) &&
+	       private_pt_command(slot, command);
 }
 
 static bool program_pt(unsigned long root, unsigned int slot)
@@ -172,10 +268,11 @@ static bool program_pt(unsigned long root, unsigned int slot)
 		return false;
 	dsb(sy);
 	return private_pt_root(slot) == root &&
-		reg_read(AS_MEMATTR_LO(slot)) == (uint32_t)PRIVATE_MEMATTR &&
-		reg_read(AS_MEMATTR_HI(slot)) == (uint32_t)(PRIVATE_MEMATTR >> 32U) &&
-		reg_read(AS_TRANSCFG_LO(slot)) == (uint32_t)PRIVATE_TRANSCFG &&
-		reg_read(AS_TRANSCFG_HI(slot)) == 0U;
+	       reg_read(AS_MEMATTR_LO(slot)) == (uint32_t)PRIVATE_MEMATTR &&
+	       reg_read(AS_MEMATTR_HI(slot)) ==
+		       (uint32_t)(PRIVATE_MEMATTR >> 32U) &&
+	       reg_read(AS_TRANSCFG_LO(slot)) == (uint32_t)PRIVATE_TRANSCFG &&
+	       reg_read(AS_TRANSCFG_HI(slot)) == 0U;
 }
 
 bool plat_opencca_gpu_pt_install(unsigned long root, unsigned int slot)
@@ -192,7 +289,8 @@ bool plat_opencca_gpu_pt_sync(unsigned long root)
 		return false;
 	present = reg_read(GPU_AS_PRESENT);
 	for (unsigned int slot = 1U; slot < GPU_AS_COUNT; slot++) {
-		if ((present & (1U << slot)) == 0U || private_pt_root(slot) != root)
+		if ((present & (1U << slot)) == 0U ||
+		    private_pt_root(slot) != root)
 			continue;
 		if (found != GPU_AS_COUNT)
 			return false; /* Unexpected alias of the same protected root. */
@@ -204,18 +302,20 @@ bool plat_opencca_gpu_pt_sync(unsigned long root)
 static bool firmware_device_ready(unsigned long root)
 {
 	return private_pt_ready(root) && (reg_read(GPU_ID) >> 24U) == 0xa8U &&
-		(reg_read(GPU_AS_PRESENT) & 1U) != 0U &&
-		(reg_read(GPU_STATUS) & ((1U << 4U) | (1U << 7U) | (1U << 8U))) == 0U;
+	       (reg_read(GPU_AS_PRESENT) & 1U) != 0U &&
+	       (reg_read(GPU_STATUS) &
+		((1U << 4U) | (1U << 7U) | (1U << 8U))) == 0U;
 }
 
 static bool firmware_boot_failed(const char *phase)
 {
 	/* Fixed status registers only: never log PT roots or Client addresses. */
 	ERROR("GPU FW %s: mcu=%x/%x gpu=%x irq=%x/%x/%x l2=%x as0=%x fault=%x\n",
-		phase, reg_read(MCU_CONTROL), reg_read(MCU_STATUS), reg_read(GPU_STATUS),
-		reg_read(GPU_INT_RAWSTAT), reg_read(JOB_INT_RAWSTAT),
-		reg_read(MMU_INT_RAWSTAT), reg_read(L2_READY_LO),
-		reg_read(AS_STATUS(0U)), reg_read(AS_BASE(0U) + 0x1cUL));
+	      phase, reg_read(MCU_CONTROL), reg_read(MCU_STATUS),
+	      reg_read(GPU_STATUS), reg_read(GPU_INT_RAWSTAT),
+	      reg_read(JOB_INT_RAWSTAT), reg_read(MMU_INT_RAWSTAT),
+	      reg_read(L2_READY_LO), reg_read(AS_STATUS(0U)),
+	      reg_read(AS_BASE(0U) + 0x1cUL));
 	return false;
 }
 
@@ -223,7 +323,8 @@ bool plat_opencca_gpu_firmware_install(unsigned long root)
 {
 	unsigned long previous;
 
-	if (!firmware_device_ready(root) || (reg_read(GPU_L2_PRESENT_LO) & 1U) == 0U)
+	if (!firmware_device_ready(root) ||
+	    (reg_read(GPU_L2_PRESENT_LO) & 1U) == 0U)
 		return firmware_boot_failed("install-readiness");
 	previous = private_pt_root(0U);
 	if (previous != 0UL && previous != root)
@@ -248,7 +349,8 @@ bool plat_opencca_gpu_firmware_boot(unsigned long root)
 	    reg_read(AS_MEMATTR_LO(0U)) != (uint32_t)PRIVATE_MEMATTR ||
 	    reg_read(AS_MEMATTR_HI(0U)) != (uint32_t)(PRIVATE_MEMATTR >> 32U) ||
 	    reg_read(AS_TRANSCFG_LO(0U)) != (uint32_t)PRIVATE_TRANSCFG ||
-	    reg_read(AS_TRANSCFG_HI(0U)) != 0U || (reg_read(L2_READY_LO) & 1U) == 0U)
+	    reg_read(AS_TRANSCFG_HI(0U)) != 0U ||
+	    (reg_read(L2_READY_LO) & 1U) == 0U)
 		return firmware_boot_failed("boot-readiness");
 	for (unsigned int slot = 1U; slot < GPU_AS_COUNT; slot++)
 		if ((reg_read(GPU_AS_PRESENT) & (1U << slot)) != 0U &&
@@ -264,14 +366,17 @@ bool plat_opencca_gpu_firmware_boot(unsigned long root)
 	reg_write(JOB_INT_CLEAR, JOB_GLOBAL_IF);
 	reg_write(GPU_COHERENCY_PROTOCOL, GPU_COHERENCY_NONE);
 	dsb(sy);
-	reg_write(MCU_CONTROL, 2U); /* MCU_CONTROL_AUTO, fixed trusted operation. */
+	reg_write(MCU_CONTROL,
+		  2U); /* MCU_CONTROL_AUTO, fixed trusted operation. */
 	dsb(sy);
-	if (!poll_timeout(JOB_INT_RAWSTAT, JOB_GLOBAL_IF, JOB_GLOBAL_IF, BOOT_TIMEOUT_US))
+	if (!poll_timeout(JOB_INT_RAWSTAT, JOB_GLOBAL_IF, JOB_GLOBAL_IF,
+			  BOOT_TIMEOUT_US))
 		return firmware_boot_failed("boot-timeout");
 	if (!(reg_read(MCU_STATUS) == 1U && reg_read(MCU_CONTROL) == 2U &&
-		reg_read(GPU_COHERENCY_PROTOCOL) == GPU_COHERENCY_NONE && private_pt_root(0U) == root &&
-		(reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK) == 0U &&
-		(reg_read(GPU_INT_RAWSTAT) & 3U) == 0U))
+	      reg_read(GPU_COHERENCY_PROTOCOL) == GPU_COHERENCY_NONE &&
+	      private_pt_root(0U) == root &&
+	      (reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK) == 0U &&
+	      (reg_read(GPU_INT_RAWSTAT) & 3U) == 0U))
 		return firmware_boot_failed("boot-status");
 	INFO("GPU FW boot indication verified\n");
 	return true;
@@ -279,58 +384,76 @@ bool plat_opencca_gpu_firmware_boot(unsigned long root)
 
 static bool firmware_running(unsigned long root)
 {
-	uint32_t mmu = reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK;
-	uint32_t gpu = reg_read(GPU_INT_RAWSTAT) & 3U;
-
-	if (mmu != 0U || gpu != 0U) {
-		ERROR("GPU FW fault mmu=%x gpu=%x\n", mmu, gpu);
-		if ((mmu & 1U) != 0U) {
-			uint32_t fault = reg_read(AS_FAULTSTATUS(0U));
-			uint64_t va = reg_read(AS_FAULTADDRESS_LO(0U)) |
-				((uint64_t)reg_read(AS_FAULTADDRESS_HI(0U)) << 32U);
-			unsigned int region = 0U;
-
-			/* Coarse public-layout classes only; never expose the fault VA,
-			 * roots, PTEs or Client data through a diagnostic log.
-			 * 1=null page, 2=firmware low VA, 3=shared interface,
-			 * 4=trusted MCU arena, 5=Client protected control, 0=other.
-			 */
-			if (va < 4096UL)
-				region = 1U;
-			else if (va < 0x04000000UL)
-				region = 2U;
-			else if (va >= GPU_FIRMWARE_CONTROL_VA &&
-				va < GPU_FIRMWARE_CONTROL_VA + GPU_PRIVATE_CONTROL_PAGES * 4096UL)
-				region = 4U;
-			else if (va < 0x08000000UL)
-				region = 3U;
-			else if (va >= GPU_PRIVATE_CONTROL_GPU_VA && va < (UINT64_C(1) << 48U))
-				region = 5U;
-			ERROR("GPU AS0 fault type=%x access=%u source=%x region=%u\n",
-				fault & 255U, (fault >> 8U) & 3U, fault >> 16U, region);
-			/* AS0's fixed low firmware VA layout is public. A virtual page
-			 * number here identifies missing MCU backing; never print a PA,
-			 * a root, a Client AS fault address or addresses outside this band.
-			 */
-			if (region == 2U)
-				ERROR("GPU MCU image fault page=%x\n", (uint32_t)(va >> 12U));
-		}
-	}
-	return root != 0UL && (root & 4095UL) == 0UL &&
+	/* Keep the complete fresh acceptance predicate in the hot path. Fault
+	 * reporting is diagnostic only and must not add reads to accepted calls.
+	 */
+	bool running =
+		root != 0UL && (root & 4095UL) == 0UL &&
 		root < (1UL << plat_opencca_gpu_pa_bits()) &&
 		(reg_read(GPU_ID) >> 24U) == 0xa8U &&
-		(reg_read(GPU_AS_PRESENT) & 1U) != 0U && private_pt_root(0U) == root &&
+		(reg_read(GPU_AS_PRESENT) & 1U) != 0U &&
+		private_pt_root(0U) == root &&
 		reg_read(AS_MEMATTR_LO(0U)) == (uint32_t)PRIVATE_MEMATTR &&
-		reg_read(AS_MEMATTR_HI(0U)) == (uint32_t)(PRIVATE_MEMATTR >> 32U) &&
+		reg_read(AS_MEMATTR_HI(0U)) ==
+			(uint32_t)(PRIVATE_MEMATTR >> 32U) &&
 		reg_read(AS_TRANSCFG_LO(0U)) == (uint32_t)PRIVATE_TRANSCFG &&
 		reg_read(AS_TRANSCFG_HI(0U)) == 0U &&
 		reg_read(MCU_CONTROL) == 2U && reg_read(MCU_STATUS) == 1U &&
 		reg_read(GPU_COHERENCY_PROTOCOL) == GPU_COHERENCY_NONE &&
 		(reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK) == 0U &&
 		(reg_read(GPU_INT_RAWSTAT) & 3U) == 0U;
+
+	if (!running) {
+		uint32_t mmu = reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK;
+		uint32_t gpu = reg_read(GPU_INT_RAWSTAT) & 3U;
+
+		if (mmu != 0U || gpu != 0U) {
+			ERROR("GPU FW fault mmu=%x gpu=%x\n", mmu, gpu);
+			if ((mmu & 1U) != 0U) {
+				uint32_t fault = reg_read(AS_FAULTSTATUS(0U));
+				uint64_t va = reg_read(AS_FAULTADDRESS_LO(0U)) |
+					      ((uint64_t)reg_read(
+						       AS_FAULTADDRESS_HI(0U))
+					       << 32U);
+				unsigned int region = 0U;
+
+				/* Coarse public-layout classes only; never expose the fault VA,
+				 * roots, PTEs or Client data through a diagnostic log.
+				 * 1=null page, 2=firmware low VA, 3=shared interface,
+				 * 4=trusted MCU arena, 5=Client protected control, 0=other.
+				 */
+				if (va < 4096UL)
+					region = 1U;
+				else if (va < 0x04000000UL)
+					region = 2U;
+				else if (va >= GPU_FIRMWARE_CONTROL_VA &&
+					 va < GPU_FIRMWARE_CONTROL_VA +
+							 GPU_PRIVATE_CONTROL_PAGES *
+								 4096UL)
+					region = 4U;
+				else if (va < 0x08000000UL)
+					region = 3U;
+				else if (va >= GPU_PRIVATE_CONTROL_GPU_VA &&
+					 va < (UINT64_C(1) << 48U))
+					region = 5U;
+				ERROR("GPU AS0 fault type=%x access=%u source=%x region=%u\n",
+				      fault & 255U, (fault >> 8U) & 3U,
+				      fault >> 16U, region);
+				/* AS0's fixed low firmware VA layout is public. A virtual page
+				 * number here identifies missing MCU backing; never print a PA,
+				 * a root, a Client AS fault address or addresses outside this band.
+				 */
+				if (region == 2U)
+					ERROR("GPU MCU image fault page=%x\n",
+					      (uint32_t)(va >> 12U));
+			}
+		}
+	}
+	return running;
 }
 
-bool plat_opencca_gpu_pt_prepare(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing)
+bool plat_opencca_gpu_pt_prepare(unsigned long root, unsigned int slot,
+				 unsigned long firmware_root, bool existing)
 {
 	unsigned long previous;
 
@@ -344,22 +467,27 @@ bool plat_opencca_gpu_pt_prepare(unsigned long root, unsigned int slot, unsigned
 		 * slot and all hardware groups; unexplained or changed roots fail.
 		 */
 		return previous == root &&
-			reg_read(AS_MEMATTR_LO(slot)) == (uint32_t)PRIVATE_MEMATTR &&
-			reg_read(AS_MEMATTR_HI(slot)) == (uint32_t)(PRIVATE_MEMATTR >> 32U) &&
-			reg_read(AS_TRANSCFG_LO(slot)) == (uint32_t)PRIVATE_TRANSCFG &&
-			reg_read(AS_TRANSCFG_HI(slot)) == 0U;
+		       reg_read(AS_MEMATTR_LO(slot)) ==
+			       (uint32_t)PRIVATE_MEMATTR &&
+		       reg_read(AS_MEMATTR_HI(slot)) ==
+			       (uint32_t)(PRIVATE_MEMATTR >> 32U) &&
+		       reg_read(AS_TRANSCFG_LO(slot)) ==
+			       (uint32_t)PRIVATE_TRANSCFG &&
+		       reg_read(AS_TRANSCFG_HI(slot)) == 0U;
 	}
-	return previous == 0UL && program_pt(root, slot) && firmware_running(firmware_root);
+	return previous == 0UL && program_pt(root, slot) &&
+	       firmware_running(firmware_root);
 }
 
-bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot, unsigned long firmware_root)
+bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot,
+				unsigned long firmware_root)
 {
 	for (unsigned int pass = 0U; pass < 2U; pass++) {
-		if (!plat_opencca_gpu_pt_prepare(root, slot, firmware_root, true))
+		if (!plat_opencca_gpu_pt_prepare(root, slot, firmware_root,
+						 true))
 			return false;
-		for (unsigned int other = 1U; other < GPU_AS_COUNT; other++)
-			if (other != slot && private_pt_root(other) == root)
-				return false;
+		if (!private_pt_no_aliases(slot, root))
+			return false;
 		/* PTE stores and PoC maintenance precede this callback. Flush only
 		 * this AS; recheck roots/attributes/aliases after completion too.
 		 */
@@ -370,19 +498,21 @@ bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot, unsigned 
 }
 
 bool plat_opencca_gpu_pt_flush_live(unsigned long root, unsigned int slot,
-		unsigned long firmware_root)
+				    unsigned long firmware_root)
 {
 	struct gpu_firmware_config before, after;
 	unsigned long frequency = read_cntfrq_el0();
 
 	for (unsigned int pass = 0U; pass < 2U; pass++) {
-		if (!plat_opencca_gpu_pt_prepare(root, slot, firmware_root, true) ||
-		    !plat_opencca_gpu_firmware_configuration(firmware_root,
-				pass == 0U ? &before : &after))
+		/* Each side gets an independent full running check. No result crosses
+		 * FLUSH_MEM or the cache callback; roots, aliases and faults stay fresh.
+		 */
+		if (!plat_opencca_gpu_pt_check_running(
+			    root, slot, firmware_root,
+			    pass == 0U ? &before : &after))
 			return false;
-		for (unsigned int other = 1U; other < GPU_AS_COUNT; other++)
-			if (other != slot && private_pt_root(other) == root)
-				return false;
+		if (!private_pt_no_aliases(slot, root))
+			return false;
 		if (!poll(AS_STATUS(slot), AS_ACTIVE, 0U))
 			return false;
 		/* No UPDATE, root/attribute write, queue publication or doorbell.
@@ -393,14 +523,14 @@ bool plat_opencca_gpu_pt_flush_live(unsigned long root, unsigned int slot,
 			return false;
 	}
 	return read_cntfrq_el0() == frequency &&
-		before.shader_mask == after.shader_mask &&
-		before.poweroff_timer == after.poweroff_timer &&
-		before.idle_timer == after.idle_timer &&
-		before.ack_timeout_ticks == after.ack_timeout_ticks;
+	       before.shader_mask == after.shader_mask &&
+	       before.poweroff_timer == after.poweroff_timer &&
+	       before.idle_timer == after.idle_timer &&
+	       before.ack_timeout_ticks == after.ack_timeout_ticks;
 }
 
 bool plat_opencca_gpu_pt_detach(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, bool detached)
+				unsigned long firmware_root, bool detached)
 {
 	struct gpu_firmware_config config;
 
@@ -423,36 +553,41 @@ bool plat_opencca_gpu_pt_detach(unsigned long root, unsigned int slot,
 		/* The live primitive already validates these before first detach.
 		 * A disabled replay cannot use it; retain its read-only checks here.
 		 */
-		if (slot == 0U || slot >= GPU_AS_COUNT || root == firmware_root ||
-		    !private_pt_format(root) ||
-		    !plat_opencca_gpu_firmware_configuration(firmware_root, &config) ||
+		if (slot == 0U || slot >= GPU_AS_COUNT ||
+		    root == firmware_root || !private_pt_format(root) ||
+		    !plat_opencca_gpu_firmware_configuration(firmware_root,
+							     &config) ||
 		    (reg_read(GPU_AS_PRESENT) & (1U << slot)) == 0U)
 			return false;
 		/* A duplicate root would leave a DMA path through another AS. */
-		for (unsigned int other = 1U; other < GPU_AS_COUNT; other++)
-			if (other != slot && private_pt_root(other) == root)
-				return false;
+		if (!private_pt_no_aliases(slot, root))
+			return false;
 	}
 	/* Replays replace the firmware consumer's duplicate configuration reads.
 	 * Check the complete trusted configuration on both sides of AS validation;
 	 * never reuse a proof from an earlier call or across cache callbacks.
 	 */
 	return poll(AS_STATUS(slot), AS_ACTIVE, 0U) &&
-		(detached ? plat_opencca_gpu_firmware_configuration(firmware_root, &config) :
-		 firmware_running(firmware_root)) &&
-		private_pt_root(slot) == 0UL && reg_read(AS_MEMATTR_LO(slot)) == 0U &&
-		reg_read(AS_MEMATTR_HI(slot)) == 0U && reg_read(AS_TRANSCFG_LO(slot)) == 1U &&
-		reg_read(AS_TRANSCFG_HI(slot)) == 0U;
+	       (detached ? plat_opencca_gpu_firmware_configuration(
+				   firmware_root, &config) :
+			   firmware_running(firmware_root)) &&
+	       private_pt_root(slot) == 0UL &&
+	       reg_read(AS_MEMATTR_LO(slot)) == 0U &&
+	       reg_read(AS_MEMATTR_HI(slot)) == 0U &&
+	       reg_read(AS_TRANSCFG_LO(slot)) == 1U &&
+	       reg_read(AS_TRANSCFG_HI(slot)) == 0U;
 }
 
-bool plat_opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firmware_config *config)
+bool plat_opencca_gpu_firmware_configuration(unsigned long root,
+					     struct gpu_firmware_config *config)
 {
 	unsigned long frequency = read_cntfrq_el0();
 
 	if (config == NULL || !firmware_running(root) || frequency == 0UL ||
 	    frequency > 1000000000UL)
 		return false;
-	config->shader_mask = reg_read(GPU_SHADER_PRESENT_LO) |
+	config->shader_mask =
+		reg_read(GPU_SHADER_PRESENT_LO) |
 		((uint64_t)reg_read(GPU_SHADER_PRESENT_HI) << 32U);
 	if (config->shader_mask == 0U || reg_read(GPU_TILER_PRESENT_LO) != 1U ||
 	    reg_read(GPU_TILER_PRESENT_HI) != 0U)
@@ -460,14 +595,17 @@ bool plat_opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firm
 	/* Native time conversion, trusted architectural counter, 1024-cycle
 	 * units. Neither the timer source nor the enabled shader mask is RPC data.
 	 */
-	config->poweroff_timer = (uint32_t)((frequency * 10000UL + 1023999999UL) / 1024000000UL);
-	config->idle_timer = (uint32_t)((frequency * 800UL + 1023999999UL) / 1024000000UL);
+	config->poweroff_timer =
+		(uint32_t)((frequency * 10000UL + 1023999999UL) / 1024000000UL);
+	config->idle_timer =
+		(uint32_t)((frequency * 800UL + 1023999999UL) / 1024000000UL);
 	config->ack_timeout_ticks = (frequency + 9UL) / 10UL; /* 100 ms. */
 	return true;
 }
 
 bool plat_opencca_gpu_pt_check_running(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, struct gpu_firmware_config *config)
+				       unsigned long firmware_root,
+				       struct gpu_firmware_config *config)
 {
 	unsigned long frequency = read_cntfrq_el0();
 
@@ -482,7 +620,8 @@ bool plat_opencca_gpu_pt_check_running(unsigned long root, unsigned int slot,
 	    (reg_read(GPU_AS_PRESENT) & (1U << slot)) == 0U ||
 	    private_pt_root(slot) != root ||
 	    reg_read(AS_MEMATTR_LO(slot)) != (uint32_t)PRIVATE_MEMATTR ||
-	    reg_read(AS_MEMATTR_HI(slot)) != (uint32_t)(PRIVATE_MEMATTR >> 32U) ||
+	    reg_read(AS_MEMATTR_HI(slot)) !=
+		    (uint32_t)(PRIVATE_MEMATTR >> 32U) ||
 	    reg_read(AS_TRANSCFG_LO(slot)) != (uint32_t)PRIVATE_TRANSCFG ||
 	    reg_read(AS_TRANSCFG_HI(slot)) != 0U)
 		return false;
@@ -490,10 +629,10 @@ bool plat_opencca_gpu_pt_check_running(unsigned long root, unsigned int slot,
 	 * Recheck those dynamic fields after the Client AS read, as well as the
 	 * trusted timer. Static roots/attributes were all read in this invocation.
 	 */
-	return read_cntfrq_el0() == frequency &&
-		reg_read(MCU_CONTROL) == 2U && reg_read(MCU_STATUS) == 1U &&
-		(reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK) == 0U &&
-		(reg_read(GPU_INT_RAWSTAT) & 3U) == 0U;
+	return read_cntfrq_el0() == frequency && reg_read(MCU_CONTROL) == 2U &&
+	       reg_read(MCU_STATUS) == 1U &&
+	       (reg_read(MMU_INT_RAWSTAT) & MMU_FAULT_MASK) == 0U &&
+	       (reg_read(GPU_INT_RAWSTAT) & 3U) == 0U;
 }
 
 bool plat_opencca_gpu_firmware_notify(unsigned long root)
@@ -505,6 +644,27 @@ bool plat_opencca_gpu_firmware_notify(unsigned long root)
 	 */
 	dsb(sy);
 	reg_write(GLOBAL_DOORBELL, 1U);
+	dsb(sy);
+	return firmware_running(root);
+}
+
+bool plat_opencca_gpu_firmware_queue_notify(unsigned long root,
+					    unsigned int csg)
+{
+	unsigned long offset;
+
+	/* The fixed CSF user doorbell already installed in every queue is
+	 * csg+1 (native Panthor assignment). No Proxy offset/value is accepted.
+	 * Bound both the FW slot namespace and the actual mapped GPU window.
+	 */
+	if (csg >= GPU_FIRMWARE_GROUPS)
+		return false;
+	offset = GLOBAL_DOORBELL + ((unsigned long)csg + 1UL) * 0x10000UL;
+	if (offset > OPENCCA_GPU_MMIO_SIZE - sizeof(uint32_t) ||
+	    !firmware_running(root))
+		return false;
+	dsb(sy);
+	reg_write(offset, 1U);
 	dsb(sy);
 	return firmware_running(root);
 }
@@ -525,10 +685,12 @@ bool plat_opencca_gpu_reset(bool preserve_irqs)
 	(void)poll(MCU_STATUS, UINT32_MAX, 0U);
 	reg_write(GPU_INT_CLEAR, GPU_RESET_COMPLETED);
 	reg_write(GPU_CMD, GPU_SOFT_RESET);
-	completed = poll(GPU_INT_RAWSTAT, GPU_RESET_COMPLETED, GPU_RESET_COMPLETED);
+	completed =
+		poll(GPU_INT_RAWSTAT, GPU_RESET_COMPLETED, GPU_RESET_COMPLETED);
 	if (!completed) {
 		reg_write(GPU_CMD, GPU_HARD_RESET);
-		completed = poll(GPU_INT_RAWSTAT, GPU_RESET_COMPLETED, GPU_RESET_COMPLETED);
+		completed = poll(GPU_INT_RAWSTAT, GPU_RESET_COMPLETED,
+				 GPU_RESET_COMPLETED);
 	}
 	clear_irqs();
 	if (completed && preserve_irqs) {

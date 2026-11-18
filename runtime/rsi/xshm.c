@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include <rec.h>
+#include <opencca_gpu.h>
 #include <rsi-handler.h>
 #include <smc-rsi.h>
 #include <xshm_runtime.h>
@@ -58,6 +59,8 @@ void handle_rsi_opencca_xshm(struct rec *rec, struct rmi_rec_exit *rec_exit,
 					 rec->regs[2], &peer_id);
 	status = xshm_service_call(&xshm_rtt_ops, rec->realm_info.g_rd,
 		command, rec->regs[2], rec->regs[3], rec->regs[4], output);
+	if (command == XSHM_UNREGISTER && status == XSHM_SUCCESS)
+		opencca_gpu_service_release(rec->realm_info.g_rd);
 	if (command == XSHM_RESIDENT_BIND && status == XSHM_SUCCESS)
 		xshm_endpoint_resident_enter(rec->realm_info.g_rd,
 			read_mpidr_el1() & XSHM_MPIDR_AFFINITY_MASK);
@@ -108,5 +111,6 @@ void opencca_xshm_release_realm(struct granule *g_rd)
 	 * holds its RD reference, so registration cannot race RD recycling.
 	 */
 	/* The RMI dispatch already holds the policy gate. */
+	opencca_gpu_service_release_locked(g_rd);
 	xshm_endpoint_release(g_rd);
 }

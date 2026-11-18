@@ -36,8 +36,8 @@ static bool valid_range(unsigned long base, unsigned long size)
 	       size <= ULONG_MAX - base;
 }
 
-static bool overlaps(unsigned long a, unsigned long asize,
-		     unsigned long b, unsigned long bsize)
+static bool overlaps(unsigned long a, unsigned long asize, unsigned long b,
+		     unsigned long bsize)
 {
 	return a < b + bsize && b < a + asize;
 }
@@ -160,7 +160,7 @@ bool opencca_gpu_lease_acquire(const void *owner, const unsigned long *hpas,
 }
 
 void opencca_gpu_lease_release(const void *owner, const unsigned long *hpas,
-			      size_t count)
+			       size_t count)
 {
 	if (owner == NULL || hpas == NULL || count > OPENCCA_GPU_LEASE_BATCH)
 		return;
@@ -220,7 +220,7 @@ unsigned long opencca_gpu_lease_first(void)
 }
 
 bool opencca_dma_map_acquire(unsigned long domain, unsigned long iova,
-			    unsigned long pa, unsigned long size)
+			     unsigned long pa, unsigned long size)
 {
 	unsigned int free_slot = OPENCCA_DMA_MAP_CAPACITY;
 
@@ -244,13 +244,13 @@ bool opencca_dma_map_acquire(unsigned long domain, unsigned long iova,
 		if (opencca_gpu_lease_page_busy(pa + offset))
 			return false;
 	}
-	dma_maps[free_slot] = (struct dma_mapping){domain, iova, pa, size};
+	dma_maps[free_slot] = (struct dma_mapping){ domain, iova, pa, size };
 	dma_active++;
 	return true;
 }
 
 bool opencca_dma_map_release(unsigned long domain, unsigned long iova,
-			    unsigned long size)
+			     unsigned long size)
 {
 	unsigned long end, cursor;
 	unsigned int free_slot = OPENCCA_DMA_MAP_CAPACITY;
@@ -306,8 +306,10 @@ bool opencca_dma_map_release(unsigned long domain, unsigned long iova,
 			map->size = map_end - end;
 		} else {
 			if (end < map_end) {
-				dma_maps[free_slot] = (struct dma_mapping){domain,
-					end, map->pa + end - map->iova, map_end - end};
+				dma_maps[free_slot] = (struct dma_mapping){
+					domain, end, map->pa + end - map->iova,
+					map_end - end
+				};
 				dma_active++;
 			}
 			map->size = iova - map->iova;

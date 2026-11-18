@@ -2,6 +2,7 @@
 /* Execute the unmodified production RSI dispatcher against actual GPU cores.
  * REC, channel lookup, input copy and policy-lock primitives are host doubles.
  * Included only by the backend's GPU_DOMAIN_RSI_TEST build. */
+#include "gpu_test_diagnostic_stubs.h"
 #define MAX_CPUS 1U
 #define UPDATE_REC_RETURN_TO_REALM 1U
 struct rec { struct { const void *g_rd; } realm_info; unsigned long regs[8]; };
@@ -23,7 +24,7 @@ static void xshm_policy_unlock(void)
 	assert(domain_policy_locked);
 	domain_policy_locked = false;
 }
-static const void *xshm_endpoint_peer(const void *owner, unsigned long channel,
+static const void *domain_xshm_endpoint_peer(const void *owner, unsigned long channel,
 		unsigned long *peer)
 {
 	assert(domain_policy_locked);
@@ -32,6 +33,7 @@ static const void *xshm_endpoint_peer(const void *owner, unsigned long channel,
 	if (owner == &service) return channel == 7UL ? &client_a : channel == 8UL ? &client_b : NULL;
 	return channel == 7UL && (owner == &client_a || owner == &client_b) ? &service : NULL;
 }
+#define xshm_endpoint_peer domain_xshm_endpoint_peer
 static bool copy_page_input(struct rec *rec, unsigned long ipa, size_t bytes,
 		void *destination, struct rsi_result *res)
 {

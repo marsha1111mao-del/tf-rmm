@@ -13,7 +13,7 @@ add_library(rmm-plat-rk3588)
 #
 # Extra memory regions needed by this platform
 #
-arm_config_option_override(NAME PLAT_CMN_EXTRA_MMAP_REGIONS FORCE 4)
+arm_config_option_override(NAME PLAT_CMN_EXTRA_MMAP_REGIONS FORCE 5)
 
 # add_subdirectory("${RMM_SOURCE_DIR}/drivers/pl011" ${RMM_BINARY_DIR}/drivers/pl011)
 add_subdirectory("${RMM_SOURCE_DIR}/drivers/16550" ${RMM_BINARY_DIR}/drivers/16550)

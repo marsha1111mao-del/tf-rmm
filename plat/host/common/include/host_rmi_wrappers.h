@@ -22,6 +22,9 @@ void host_rmi_rec_create(void *rd, void *rec, void *params_ptr,
 			 struct smc_result *res);
 void host_rmi_rec_destroy(void *rec, struct smc_result *res);
 void host_rmi_realm_activate(void *rd, struct smc_result *res);
+void host_rmi_opencca_gpu_pm(unsigned long operation, unsigned long argument,
+			     unsigned long error, struct smc_result *res);
+void host_rmi_opencca_gpu_mmio_grant(void *rd, struct smc_result *res);
 void host_rmi_rec_enter(void *rec, void *run_ptr, struct smc_result *res);
 void host_rmi_data_create(uintptr_t data, void *rd, uintptr_t ipa,
 			 uintptr_t src, struct smc_result *res);

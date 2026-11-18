@@ -7,6 +7,8 @@
 #include <stdint.h>
 
 struct gpu_firmware_config;
+struct gpu_private_ops;
+struct gpu_private_result;
 
 #define GPU_PRIVATE_ABI 2UL
 #define GPU_PRIVATE_PAGE_SIZE 4096UL
@@ -53,6 +55,30 @@ struct gpu_firmware_config;
 #define GPU_PRIVATE_CAP_TASK_FINISH 17179869184UL
 #define GPU_PRIVATE_CAP_TASK_DISPATCH 34359738368UL
 #define GPU_PRIVATE_CAP_TASK_STAGE_HINT 68719476736ULL
+#define GPU_PRIVATE_CAP_MAP_TRANSACTION 137438953472ULL
+#define GPU_PRIVATE_CAP_TASK_MAPPING_VERSION 274877906944ULL
+#define GPU_PRIVATE_CAP_TASK_DISPATCH_LIVE 549755813888ULL
+#define GPU_PRIVATE_CAP_BO_IDLE 1099511627776ULL
+#define GPU_PRIVATE_CAP_TASK_OBSERVATION 2199023255552ULL
+#define GPU_PRIVATE_CAP_IRQ_SECURITY 4398046511104ULL
+#define GPU_PRIVATE_CAP_TASK_OBSERVER 8796093022208ULL
+#define GPU_PRIVATE_IRQ_PROGRESS 1U
+#define GPU_PRIVATE_IRQ_FAULT 2U
+#define GPU_PRIVATE_IRQ_COMPLETE 3U
+#define GPU_PRIVATE_IRQ_EVENT_FAULT 8U
+#define GPU_PRIVATE_OBSERVATION_READY 1UL
+#define GPU_PRIVATE_OBSERVATION_STARTED 2UL
+#define GPU_PRIVATE_OBSERVATION_PENDING 4UL
+#define GPU_PRIVATE_OBSERVATION_QUIESCED 8UL
+#define GPU_PRIVATE_OBSERVATION_COMPLETED 16UL
+#define GPU_PRIVATE_OBSERVATION_RETURNED 32UL
+#define GPU_PRIVATE_OBSERVATION_QUARANTINED 64UL
+#define GPU_PRIVATE_OBSERVATION_FAILED 128UL
+#define GPU_PRIVATE_OBSERVATION_START_ATTEMPTED 256UL
+#define GPU_PRIVATE_OBSERVATION_STOP_ATTEMPTED 512UL
+#define GPU_PRIVATE_OBSERVATION_LIVE 1024UL
+#define GPU_PRIVATE_OBSERVATION_RMM_SOURCE 65536UL
+#define GPU_PRIVATE_TASK_MAPPING_VERSION 4U
 #define GPU_PRIVATE_TASK_DEFERRED 1UL
 #define GPU_PRIVATE_TASK_DELEGATE 2UL
 #define GPU_PRIVATE_TASK_BATCH 6U
@@ -67,15 +93,58 @@ struct gpu_firmware_config;
 #define GPU_PRIVATE_BLOCKS 1024U
 #endif
 #ifndef GPU_PRIVATE_TABLES
-/* Keep the existing 38 MiB RK RMM reservation. Exhaustion rejects mappings;
- * it must never fall back to Guest-owned tables. */
-#define GPU_PRIVATE_TABLES 448U
+/* Pool sized for concurrent large Client mappings within the 44 MiB RK
+ * RMM reservation. Exhaustion still rejects; never use Guest-owned tables. */
+#define GPU_PRIVATE_TABLES 1280U
 #endif
 #define GPU_PRIVATE_CONTEXTS 32U
 #define GPU_PRIVATE_AS_SLOTS 16U
 #define GPU_PRIVATE_BO_BLOCKS 256U
 #define GPU_PRIVATE_MAP_GRANTS 128U
 #define GPU_PRIVATE_CONTEXT_GRANTS 32U
+
+/* One immutable range per transaction; ordinary VM_BIND batches retain their
+ * ordered per-operation fence semantics. A zero object denotes UNMAP.
+ * All calls use the authenticated owner and the common policy lock.
+ */
+struct gpu_private_map_request {
+	unsigned long request_id, version;
+	unsigned long object, offset, iova, count, prot;
+};
+
+enum gpu_private_map_phase {
+	GPU_PRIVATE_MAP_RESERVE = 1,
+	GPU_PRIVATE_MAP_APPLY,
+	GPU_PRIVATE_MAP_COMMIT,
+	GPU_PRIVATE_MAP_DONE,
+	GPU_PRIVATE_MAP_ABORTED,
+	GPU_PRIVATE_MAP_FAILED
+};
+
+/* BEGIN is replayable only with the identical request. STEP uses a monotonic
+ * sequence (initially zero); replay of the last step returns its saved result.
+ * Replies: [transaction, committed-or-base version, next sequence, phase].
+ * INCOMPLETE is progress, never permission to execute or signal a bind fence.
+ * ABORT before leaf mutation releases reservations; after mutation it retains
+ * all references in quarantine until trusted device revocation.
+ */
+void gpu_private_map_begin(const struct gpu_private_ops *ops, const void *owner,
+			   unsigned long context,
+			   const struct gpu_private_map_request *request,
+			   struct gpu_private_result *result);
+void gpu_private_map_step(const struct gpu_private_ops *ops, const void *owner,
+			  unsigned long transaction, unsigned long sequence,
+			  struct gpu_private_result *result);
+void gpu_private_map_abort(const struct gpu_private_ops *ops, const void *owner,
+			   unsigned long transaction,
+			   struct gpu_private_result *result);
+void gpu_private_mapping_version(const void *owner, unsigned long context,
+				 struct gpu_private_result *result);
+/* Service launch plans must carry the committed version once direct mapping
+ * is enabled. Legacy diagnostic contexts retain their zero-version ABI.
+ */
+bool gpu_private_mapping_accept(const void *service, const void *owner,
+				unsigned long context, unsigned long version);
 
 enum gpu_private_status {
 	GPU_PRIVATE_SUCCESS,
@@ -89,8 +158,17 @@ enum gpu_private_status {
  * The core never maps a data page into the service's CPU address space.
  * All calls, source RTT updates and CPU sharing use xshm_policy_lock.
  */
+/* RMM-private borrowed mapping, valid only until the matching unmap.
+ * The adapter retains the DATA granule lock for this bounded page scan.
+ */
+struct gpu_private_command_view {
+	const unsigned char *address;
+	void *granule;
+};
+
 struct gpu_private_ops {
-	bool (*source_page)(const void *owner, unsigned long ipa, unsigned long *pa);
+	bool (*source_page)(const void *owner, unsigned long ipa,
+			    unsigned long *pa);
 	unsigned long (*table_pa)(const void *table);
 	void (*clean)(const void *table, size_t bytes);
 	/* Both callbacks belong to the trusted device backend, never Proxy.
@@ -99,19 +177,23 @@ struct gpu_private_ops {
 	 * addresses are never returned to the RSI caller. A false result means
 	 * potentially partial hardware work: retain the slot and all backing.
 	 */
-	bool (*activate)(unsigned long context, unsigned long root, unsigned int slot);
+	bool (*activate)(unsigned long context, unsigned long root,
+			 unsigned int slot);
 	/* Edits to an activated context require trusted translation invalidation. */
 	bool (*synchronize)(unsigned long context, unsigned long root);
 	/* Internal control-page donation. A false hide/restore MUST leave the
 	 * CPU PTE unchanged; true completes the corresponding global TLBI.
 	 * Clearing happens through a trusted temporary mapping, not a Proxy VA.
 	 */
-	bool (*hide_page)(const void *owner, unsigned long ipa, unsigned long pa);
-	bool (*restore_page)(const void *owner, unsigned long ipa, unsigned long pa);
+	bool (*hide_page)(const void *owner, unsigned long ipa,
+			  unsigned long pa);
+	bool (*restore_page)(const void *owner, unsigned long ipa,
+			     unsigned long pa);
 	/* Restore only an assigned-empty DATA page, forcing Normal NC across
 	 * all Client S1 aliases. Same no-mutation-on-failure and TLBI contract.
 	 */
-	bool (*restore_page_uncached)(const void *owner, unsigned long ipa, unsigned long pa);
+	bool (*restore_page_uncached)(const void *owner, unsigned long ipa,
+				      unsigned long pa);
 	/* Order NC CPU writes/device return before publication, once per batch. */
 	bool (*cache_barrier)(void);
 	bool (*clear_page)(unsigned long pa);
@@ -119,20 +201,24 @@ struct gpu_private_ops {
 	 * running; never selected by a hardware CSG until the firmware core binds
 	 * it. No service-selected root, firmware root or AS index is accepted.
 	 */
-	bool (*prepare_as)(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing);
+	bool (*prepare_as)(unsigned long root, unsigned int slot,
+			   unsigned long firmware_root, bool existing);
 	/* Check an already prepared AS and the fixed MCU configuration together.
 	 * No programming, publication, or cached proof: validate actual registers
 	 * under the backend mapping lock. Other trusted adapters use prepare_as
 	 * and the firmware configuration callback separately when this is NULL.
 	 */
 	bool (*check_running_as)(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, struct gpu_firmware_config *config);
+				 unsigned long firmware_root,
+				 struct gpu_firmware_config *config);
 	/* Trusted additive mapping only. Validate the live Client/firmware roots,
 	 * flush this exact AS's PT caches, then revalidate; never install a root,
 	 * change attributes, start a queue or ring a doorbell.
 	 */
-	bool (*extend_as)(unsigned long root, unsigned int slot, unsigned long firmware_root);
-	bool (*write_page)(unsigned long pa, size_t offset, const void *data, size_t bytes);
+	bool (*extend_as)(unsigned long root, unsigned int slot,
+			  unsigned long firmware_root);
+	bool (*write_page)(unsigned long pa, size_t offset, const void *data,
+			   size_t bytes);
 	/* Clean and invalidate an entire owned data granule to PoC before the
 	 * GPU can use it; no Proxy mapping or caller-selected PA is involved.
 	 */
@@ -144,7 +230,8 @@ struct gpu_private_ops {
 	 * before and after AS validation; callers do not duplicate those checks.
 	 * Never sufficient on its own to establish firmware quiescence.
 	 */
-	bool (*detach_as)(unsigned long root, unsigned int slot, unsigned long firmware_root, bool detached);
+	bool (*detach_as)(unsigned long root, unsigned int slot,
+			  unsigned long firmware_root, bool detached);
 	/* Invalidate owned data at PoC only after trusted STOP and AS disable.
 	 * Never clean stale CPU lines back over device-produced data.
 	 */
@@ -152,7 +239,21 @@ struct gpu_private_ops {
 	/* Snapshot protected donated control data through a trusted mapping;
 	 * never a service VA or ordinary Client data page supplied by an RPC.
 	 */
-	bool (*read_page)(unsigned long pa, size_t offset, void *data, size_t bytes);
+	bool (*read_page)(unsigned long pa, size_t offset, void *data,
+			  size_t bytes);
+	/* Snapshot Client command content only after sync_page_for_device and
+	 * before admission. Resolve the PA from an owned non-control PTE; never
+	 * perform CPU-return, ownership, completion, or MMIO state transitions.
+	 */
+	bool (*read_command_page)(unsigned long pa, size_t offset, void *data,
+				  size_t bytes);
+	/* Real RSI uses one mapping per authorized page. Pure core/legacy test
+	 * adapters may use the counted read callback above; both inspect every
+	 * opcode and neither stores a cross-call proof.
+	 */
+	bool (*map_command_page)(unsigned long pa,
+				 struct gpu_private_command_view *view);
+	void (*unmap_command_page)(struct gpu_private_command_view *view);
 	/* Trusted backend guarantee: PTs/tags are writable only by this core,
 	 * under the policy lock. Allows epoch-bound reuse of validated NC/resident
 	 * mapping sets; fresh BO lifecycle/lease checks remain mandatory. False
@@ -162,7 +263,18 @@ struct gpu_private_ops {
 	/* Internal live memory barrier. Leaves roots and execution intact; false
 	 * may follow partial MMIO. Not a completion or CPU-ownership assertion.
 	 */
-	bool (*flush_as)(unsigned long root, unsigned int slot, unsigned long firmware_root);
+	bool (*flush_as)(unsigned long root, unsigned int slot,
+			 unsigned long firmware_root);
+	/* Paired trusted adapters for persistent RMM-only control views. Pin is
+	 * called AFTER hidden is recorded, so even partial failure is tracked.
+	 * Unpin must finish all-PE CPU translation retirement BEFORE RTT restore.
+	 * Failure retains the exact control object/pages. Legacy control models
+	 * leave both NULL and use their original temporary mappings.
+	 */
+	bool (*pin_control_page)(const void *owner, unsigned long control,
+				 unsigned int index, unsigned long pa);
+	bool (*unpin_control_page)(const void *owner, unsigned long control,
+				   unsigned int index, unsigned long pa);
 };
 
 struct gpu_private_result {
@@ -175,9 +287,10 @@ struct gpu_private_result {
  * call; INCOMPLETE requires another call. Never retires another owner's BO.
  */
 void gpu_private_owner_reclaim(const struct gpu_private_ops *ops,
-		const void *owner, struct gpu_private_result *result);
+			       const void *owner,
+			       struct gpu_private_result *result);
 void opencca_gpu_private_reclaim(unsigned long rd_addr,
-		struct gpu_private_result *result);
+				 struct gpu_private_result *result);
 bool gpu_private_raw_access_blocked(void);
 
 enum gpu_private_operation {
@@ -216,8 +329,8 @@ enum gpu_private_operation {
 	GPU_PRIVATE_GROUP_INSPECT,
 	GPU_PRIVATE_GROUP_VALIDATE,
 	GPU_PRIVATE_GROUP_CONFIGURE,
-	GPU_PRIVATE_TASK_STAGE,
-	GPU_PRIVATE_TASK_CANCEL,
+	/* Operation 35 (retired single-command STAGE) is not reused. */
+	GPU_PRIVATE_TASK_CANCEL = 36,
 	GPU_PRIVATE_TASK_VALIDATE,
 	GPU_PRIVATE_TASK_PREPARE,
 	GPU_PRIVATE_TASK_READY,
@@ -242,18 +355,37 @@ enum gpu_private_operation {
 	GPU_PRIVATE_TASK_READY_LAUNCH,
 	GPU_PRIVATE_TASK_FINISH,
 	GPU_PRIVATE_TASK_DISPATCH,
-	GPU_PRIVATE_TASK_STAGE_HINT
+	GPU_PRIVATE_TASK_STAGE_HINT,
+	GPU_PRIVATE_MAP_BEGIN,
+	GPU_PRIVATE_MAP_STEP,
+	GPU_PRIVATE_MAP_ABORT,
+	GPU_PRIVATE_MAPPING_VERSION,
+	GPU_PRIVATE_SERVICE_MAPPING_VERSION,
+	GPU_PRIVATE_TASK_DISPATCH_LEASE,
+	GPU_PRIVATE_TASK_DISPATCH_LIVE,
+	GPU_PRIVATE_BO_IDLE,
+	GPU_PRIVATE_TASK_OBSERVATION,
+	GPU_PRIVATE_TASK_IRQ_PEEK,
+	GPU_PRIVATE_TASK_IRQ_CLAIM,
+	GPU_PRIVATE_IRQ_STATUS,
+	GPU_PRIVATE_IRQ_SELFTEST,
+	GPU_PRIVATE_GROUP_IRQ_PEEK,
+	GPU_PRIVATE_GROUP_IRQ_CLAIM,
+	GPU_PRIVATE_TASK_OBSERVER_ARM,
+	GPU_PRIVATE_TASK_OBSERVER_POLL
 };
 
+void gpu_private_bo_idle(const void *owner, unsigned long handle,
+			 struct gpu_private_result *result);
 void gpu_private_bo_create(const void *owner, const void *service,
-		unsigned long size, unsigned long access,
-		struct gpu_private_result *result);
+			   unsigned long size, unsigned long access,
+			   struct gpu_private_result *result);
 void gpu_private_bo_append(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, unsigned long offset,
-		const unsigned long *ipas, size_t count,
-		struct gpu_private_result *result);
+			   unsigned long handle, unsigned long offset,
+			   const unsigned long *ipas, size_t count,
+			   struct gpu_private_result *result);
 void gpu_private_bo_destroy(const void *owner, unsigned long handle,
-		struct gpu_private_result *result);
+			    struct gpu_private_result *result);
 /* Original Client only, before any mapping/grant. Hide each CPU RTT leaf,
  * complete its global TLBI, then flush initialized contents to the GPU.
  * Bounded and irreversible: errors close the BO and retain the hidden prefix.
@@ -263,42 +395,49 @@ void gpu_private_bo_destroy(const void *owner, unsigned long handle,
  * cannot release a sealed BO without these trusted operations.
  */
 void gpu_private_bo_seal(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result);
-void gpu_private_bo_uncached(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result);
-void gpu_private_bo_release(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long handle, struct gpu_private_result *result);
+			 unsigned long handle,
+			 struct gpu_private_result *result);
+void gpu_private_bo_uncached(const struct gpu_private_ops *ops,
+			     const void *owner, unsigned long handle,
+			     struct gpu_private_result *result);
+void gpu_private_bo_release(const struct gpu_private_ops *ops,
+			    const void *owner, unsigned long handle,
+			    struct gpu_private_result *result);
 /* Only the actual isolated service may donate its own previously private,
  * unshared pages. Distinct type: never imported as a Client data BO.
  */
 void gpu_private_control_create(const void *service, unsigned long size,
-		struct gpu_private_result *result);
-void gpu_private_control_append(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, unsigned long offset, const unsigned long *ipas,
-		size_t count, struct gpu_private_result *result);
-void gpu_private_control_destroy(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, struct gpu_private_result *result);
+				struct gpu_private_result *result);
+void gpu_private_control_append(const struct gpu_private_ops *ops,
+				const void *service, unsigned long handle,
+				unsigned long offset, const unsigned long *ipas,
+				size_t count,
+				struct gpu_private_result *result);
+void gpu_private_control_destroy(const struct gpu_private_ops *ops,
+				 const void *service, unsigned long handle,
+				 struct gpu_private_result *result);
 /* Trusted firmware consumer only; no RSI exposes these PAs. Acquire clears
  * and pins all sealed pages; release is allowed only before hardware exposure
  * or after verified reset. Device retirement also drops the firmware hold.
  */
-bool gpu_private_control_acquire(const struct gpu_private_ops *ops, const void *service,
-		unsigned long handle, unsigned int *pages);
+bool gpu_private_control_acquire(const struct gpu_private_ops *ops,
+				 const void *service, unsigned long handle,
+				 unsigned int *pages);
 bool gpu_private_control_page(const void *service, unsigned long handle,
-		unsigned int index, unsigned long *pa);
+			      unsigned int index, unsigned long *pa);
 void gpu_private_control_release(const void *service, unsigned long handle);
 void gpu_private_context_create(const struct gpu_private_ops *ops,
-		const void *owner, const void *service,
-		struct gpu_private_result *result);
+				const void *owner, const void *service,
+				struct gpu_private_result *result);
 void gpu_private_context_destroy(const struct gpu_private_ops *ops,
-		const void *owner, unsigned long context,
-		struct gpu_private_result *result);
+				 const void *owner, unsigned long context,
+				 struct gpu_private_result *result);
 /* Trusted group-memory consumer only. Authenticated owner/service must match
  * the actual context. Holds prevent context reuse until group retirement;
  * verified whole-device revocation retires all holds with the groups.
  */
 bool gpu_private_context_hold(const void *service, const void *owner,
-		unsigned long context);
+			      unsigned long context);
 void gpu_private_context_put(const void *owner, unsigned long context);
 /* Trusted task consumer: validate every command-stream page using real PTEs
  * and private object tags, then freeze this context's mappings. CPU contents
@@ -307,9 +446,14 @@ void gpu_private_context_put(const void *owner, unsigned long context);
  * quiescence until CPU cache return/retirement; service assertions never
  * authorize release. Unprepared records may be cancelled without hardware.
  */
-bool gpu_private_task_hold(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context, unsigned long start,
-		unsigned long bytes);
+/* Single-range adapter used by the backend, firmware and private-heap models.
+ * Production staging uses the batch/live entry points below/above; this
+ * adapter delegates to the same batch validation rather than a second policy.
+ */
+bool gpu_private_task_hold(const struct gpu_private_ops *ops,
+			   const void *service, const void *owner,
+			   unsigned long context, unsigned long start,
+			   unsigned long bytes);
 struct gpu_private_command_range {
 	unsigned long start, bytes;
 };
@@ -317,9 +461,20 @@ struct gpu_private_command_range {
  * context reference. Empty ranges represent fence-only members (start=0).
  * The entire batch, including repeated pages, walks at most 512 pages.
  */
-bool gpu_private_task_hold_batch(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context,
-		const struct gpu_private_command_range *ranges, unsigned int count);
+bool gpu_private_task_hold_batch(const struct gpu_private_ops *ops,
+				 const void *service, const void *owner,
+				 unsigned long context,
+				 const struct gpu_private_command_range *ranges,
+				 unsigned int count);
+/* Pre-hold command-content scan. Reads every 8-byte instruction through the
+ * trusted PTE/private-object mapping and rejects unless permit() accepts its
+ * opcode. No reference is retained when any member is unreadable or denied.
+ */
+bool gpu_private_task_scan_commands(
+	const struct gpu_private_ops *ops, const void *service,
+	const void *owner, unsigned long context,
+	const struct gpu_private_command_range *ranges, unsigned int count,
+	bool (*permit)(uint64_t opcode));
 bool gpu_private_task_put(const void *owner, unsigned long context);
 /* Trusted live-domain consumers/test view only; none is an RSI operation.
  * Eligibility requires an epoch-valid, protected NC/resident-only mapping
@@ -329,20 +484,24 @@ bool gpu_private_task_put(const void *owner, unsigned long context);
  * it freezes ownership, never authorizes RETURN/RETIRE or CPU-page release.
  */
 bool gpu_private_task_live_eligible(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task);
+				    const void *service, const void *owner,
+				    unsigned long context, unsigned long task);
 bool gpu_private_task_flush_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long firmware_root);
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task,
+				 unsigned long firmware_root);
 bool gpu_private_task_mark_drained(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task);
+				   const void *service, const void *owner,
+				   unsigned long context, unsigned long task);
 /* Internal certificate query only; firmware must also revalidate the hidden
  * idle anchor and real roots/configuration/queues before using this proof.
  */
 bool gpu_private_task_is_drained(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task);
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task);
 /* Discard a previous idle observation before starting any fresh observation. */
 void gpu_private_task_clear_drained(const void *service, const void *owner,
-		unsigned long context, unsigned long task);
+				    unsigned long context, unsigned long task);
 /* Reserve a separately staged successor while a trusted drained task keeps
  * the AS/mapping/cache leases. Ordinary HOLD/PUT still reject active contexts.
  * Handoff atomically replaces the predecessor's cache token with the staged
@@ -350,35 +509,46 @@ void gpu_private_task_clear_drained(const void *service, const void *owner,
  * callback occurs; firmware must commit its ring/history/token state too.
  */
 bool gpu_private_task_hold_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, const struct gpu_private_command_range *ranges, unsigned int count);
+				const void *service, const void *owner,
+				unsigned long context, unsigned long task,
+				const struct gpu_private_command_range *ranges,
+				unsigned int count);
 bool gpu_private_task_put_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context, unsigned long task);
+			       const void *service, const void *owner,
+			       unsigned long context, unsigned long task);
 bool gpu_private_task_handoff_live(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long previous, unsigned long next);
+				   const void *service, const void *owner,
+				   unsigned long context,
+				   unsigned long previous, unsigned long next);
 void gpu_private_context_prepare(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long firmware_root, struct gpu_private_result *result);
+				 const void *service, const void *owner,
+				 unsigned long context,
+				 unsigned long firmware_root,
+				 struct gpu_private_result *result);
 void gpu_private_context_check_running(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long firmware_root, struct gpu_firmware_config *config,
-		struct gpu_private_result *result);
+				       const void *service, const void *owner,
+				       unsigned long context,
+				       unsigned long firmware_root,
+				       struct gpu_firmware_config *config,
+				       struct gpu_private_result *result);
 /* Trusted firmware consumer after verified STOP/TERMINATE, with no sibling
  * published CSG using this context. Disables the AS but retains all references
  * and cache ownership until subsequent trusted CPU cache return/retirement.
  */
 void gpu_private_context_quiesce(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long firmware_root, struct gpu_private_result *result);
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long task,
+				 unsigned long firmware_root,
+				 struct gpu_private_result *result);
 /* Trusted consumer only: mappings are frozen by task holds. Walk at most
  * GPU_PRIVATE_BATCH leaf entries/call, keep cursor/token in RMM, skip internal
  * control pages, and retain any partial/ambiguous synchronization until reset.
  * value[0] is the cumulative data-page count, never a backing or table address.
  */
 void gpu_private_task_cache(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, struct gpu_private_result *result);
+			    const void *service, const void *owner,
+			    unsigned long context, unsigned long task,
+			    struct gpu_private_result *result);
 /* Internal firmware consumer only, after authenticating a pending tiler OOM.
  * Add a fresh Client-owned RW/XN/WB chunk (32..2048 pages) to empty VA without
  * thawing existing mappings. One <=512-page batch per call, fixed object/VA
@@ -388,16 +558,19 @@ void gpu_private_task_cache(const struct gpu_private_ops *ops,
  * This primitive is not an RSI mapping authorization or an OOM acknowledgement.
  */
 void gpu_private_task_extend(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, unsigned long object, unsigned long iova,
-		unsigned long firmware_root, struct gpu_private_result *result);
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long task,
+			     unsigned long object, unsigned long iova,
+			     unsigned long firmware_root,
+			     struct gpu_private_result *result);
 /* Trusted firmware consumer after rechecking quiescence and disabled AS on
  * EVERY batch. Invalidates private data only, with an independent private
  * cursor; does not release cache/task/backing/AS leases or authorize reuse.
  */
 void gpu_private_task_return(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long task, struct gpu_private_result *result);
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long task,
+			     struct gpu_private_result *result);
 /* Trusted firmware consumer only, after complete CPU return, protected group
  * scrub and stopped/disabled hardware revalidation. Drops this task's hold,
  * AS reservation and cache leases; leaves BO mappings and other staged holds.
@@ -406,24 +579,27 @@ void gpu_private_task_return(const struct gpu_private_ops *ops,
  * hardware or backing-page callback; caller separately checks real STOP/AS.
  */
 void gpu_private_task_returned(const void *service, const void *owner,
-		unsigned long context, unsigned long task, struct gpu_private_result *result);
+			       unsigned long context, unsigned long task,
+			       struct gpu_private_result *result);
 
 bool gpu_private_task_retire(const void *service, const void *owner,
-		unsigned long context, unsigned long task);
+			     unsigned long context, unsigned long task);
 /* Trusted consumer only. Maps donated, CPU-hidden arena pages at fixed VAs;
  * Client MAP/UNMAP cannot touch these leaves. No hardware-active edits yet.
  */
 void gpu_private_control_mapping(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long object, unsigned int first, unsigned int count,
-		bool writable, bool install, struct gpu_private_result *result);
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long object,
+				 unsigned int first, unsigned int count,
+				 bool writable, bool install,
+				 struct gpu_private_result *result);
 void gpu_private_map(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long object, unsigned long offset,
-		unsigned long iova, size_t count, unsigned long prot,
-		struct gpu_private_result *result);
+		     unsigned long context, unsigned long object,
+		     unsigned long offset, unsigned long iova, size_t count,
+		     unsigned long prot, struct gpu_private_result *result);
 void gpu_private_unmap(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long iova, size_t count,
-		struct gpu_private_result *result);
+		       unsigned long context, unsigned long iova, size_t count,
+		       struct gpu_private_result *result);
 /* Atomic cleanup of an uncertain MAP attempt. Empty/other-object leaves stay
  * unchanged. Matching leaves must point at the specified BO page offset;
  * malformed tables or mismatched offsets reject the entire batch. The caller
@@ -431,40 +607,50 @@ void gpu_private_unmap(const struct gpu_private_ops *ops, const void *owner,
  * or reserve VA: outstanding grants retain their own BO/context references.
  */
 void gpu_private_unmap_bo(const struct gpu_private_ops *ops, const void *owner,
-		unsigned long context, unsigned long object, unsigned long offset,
-		unsigned long iova, size_t count, struct gpu_private_result *result);
+			  unsigned long context, unsigned long object,
+			  unsigned long offset, unsigned long iova,
+			  size_t count, struct gpu_private_result *result);
 void gpu_private_context_activate(const struct gpu_private_ops *ops,
-		const void *service, unsigned long context, unsigned long slot,
-		struct gpu_private_result *result);
+				  const void *service, unsigned long context,
+				  unsigned long slot,
+				  struct gpu_private_result *result);
 void gpu_private_query(const void *owner, unsigned long context,
-		unsigned long iova, struct gpu_private_result *result);
+		       unsigned long iova, struct gpu_private_result *result);
 /* owner is the actual peer RD resolved from the service's authenticated
  * channel by RSI, never a numeric owner supplied in an RPC payload.
  */
 void gpu_private_bo_inspect(const void *service, const void *owner,
-		unsigned long object, struct gpu_private_result *result);
+			    unsigned long object,
+			    struct gpu_private_result *result);
 void gpu_private_context_inspect(const void *service, const void *owner,
-		unsigned long context, struct gpu_private_result *result);
+				 unsigned long context,
+				 struct gpu_private_result *result);
 void gpu_private_service_map(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long authorization, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result);
+			     const void *service, const void *owner,
+			     unsigned long context, unsigned long authorization,
+			     unsigned long offset, unsigned long iova,
+			     size_t count, unsigned long prot,
+			     struct gpu_private_result *result);
 /* A Client issues an exact, one-use mapping authorization. It holds BO and
  * context references until consumed, cancelled, or trusted device release.
  * Service batches must advance sequentially; the service cannot substitute
  * BO, address, offset, access attributes or context.
  */
 void gpu_private_map_authorize(const void *owner, unsigned long context,
-		unsigned long object, unsigned long offset, unsigned long iova,
-		size_t count, unsigned long prot, struct gpu_private_result *result);
+			       unsigned long object, unsigned long offset,
+			       unsigned long iova, size_t count,
+			       unsigned long prot,
+			       struct gpu_private_result *result);
 void gpu_private_map_cancel(const void *owner, unsigned long authorization,
-		struct gpu_private_result *result);
+			    struct gpu_private_result *result);
 void gpu_private_service_map_release(const void *service, const void *owner,
-		unsigned long context, unsigned long authorization,
-		struct gpu_private_result *result);
+				     unsigned long context,
+				     unsigned long authorization,
+				     struct gpu_private_result *result);
 void gpu_private_service_unmap(const struct gpu_private_ops *ops,
-		const void *service, const void *owner, unsigned long context,
-		unsigned long iova, size_t count, struct gpu_private_result *result);
+			       const void *service, const void *owner,
+			       unsigned long context, unsigned long iova,
+			       size_t count, struct gpu_private_result *result);
 /* Trusted-device entry, not an RSI operation. Caller holds the policy gate
  * and has completed BOTH MMIO revocation and verified whole-device reset.
  * Invalidates all old contexts permanently; does not release CPU backing.
@@ -472,18 +658,20 @@ void gpu_private_service_unmap(const struct gpu_private_ops *ops,
 /* Client-only exact mapping snapshot. object=0 checks an unmapped range.
  * Returns [verified bytes, non-wrapping mapping epoch, 0, 0], never addresses.
  */
-void gpu_private_mapping_check(const struct gpu_private_ops *ops, const void *owner,
-        unsigned long context, unsigned long object, unsigned long offset,
-        unsigned long iova, size_t count, unsigned long prot,
-        struct gpu_private_result *result);
+void gpu_private_mapping_check(const struct gpu_private_ops *ops,
+			       const void *owner, unsigned long context,
+			       unsigned long object, unsigned long offset,
+			       unsigned long iova, size_t count,
+			       unsigned long prot,
+			       struct gpu_private_result *result);
 void gpu_private_device_revoked(const struct gpu_private_ops *ops);
 bool gpu_private_owner_busy(const void *owner);
 bool gpu_private_range_busy(const void *owner, unsigned long ipa,
-		unsigned long size);
-
+			    unsigned long size);
 
 /* Validated CPU-readable NC data hint, never a completion certificate. */
-bool gpu_private_task_hint_check(const struct gpu_private_ops *ops, const void *service,
-		const void *owner, unsigned long context, unsigned long iova);
+bool gpu_private_task_hint_check(const struct gpu_private_ops *ops,
+				 const void *service, const void *owner,
+				 unsigned long context, unsigned long iova);
 
 #endif

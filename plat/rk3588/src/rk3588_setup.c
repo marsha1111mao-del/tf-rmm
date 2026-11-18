@@ -68,6 +68,8 @@ void plat_setup(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3)
 		/* Accesses are authorized by the GPU/IOMMU services. OpenCCA
 		 * models the GPC restriction on untrusted CPU accesses.
 		 */
+		MAP_REGION_TRANSIENT(PLAT_CMN_GPU_CONTROL_BASE,
+			(unsigned long)PLAT_CMN_GPU_CONTROL_SLOTS * GRANULE_SIZE, GRANULE_SIZE),
 		MAP_REGION_FLAT(0xfb000000UL, SZ_2M,
 				(MT_DEVICE | MT_RW | MT_REALM)),
 		MAP_REGION_FLAT(0xfd800000UL, 8UL * SZ_1M,
@@ -122,14 +124,14 @@ void plat_setup(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3)
 			rmm_el3_ifc_report_fail_to_el3(E_RMM_BOOT_UNKNOWN_ERROR);
 		}
 
-		plat_regions[3].base_pa = uart_base;
-		plat_regions[3].base_va = uart_base;
+		plat_regions[4].base_pa = uart_base;
+		plat_regions[4].base_va = uart_base;
 	}
 
 	VERBOSE("console enabled\n");	
 
 	/* Carry on with the rest of the system setup */
-	ret = plat_cmn_setup(plat_regions, 4U);
+	ret = plat_cmn_setup(plat_regions, 5U);
 	if (ret != 0) {
 		ERROR("%s (%u): Failed to setup the platform (%i)\n",
 			__func__, __LINE__, ret);

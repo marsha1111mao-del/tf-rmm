@@ -13,4 +13,11 @@ unsigned long read_icc_hppir1_el1(void);
 unsigned long read_mpidr_el1(void);
 void test_dsb(void);
 #define dsb(scope) test_dsb()
+unsigned long read_cntpct_el0(void);
+unsigned long read_cnthp_ctl_el2(void);
+unsigned long read_cnthp_cval_el2(void);
+void write_cnthp_ctl_el2(unsigned long value);
+void write_cnthp_cval_el2(unsigned long value);
+void test_isb(void);
+#define isb() test_isb()
 #endif

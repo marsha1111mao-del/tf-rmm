@@ -12,6 +12,13 @@
 #define TIMER_BITS (VIRTUAL_BIT | PHYSICAL_BIT)
 #define OTHER_BITS 0x80001234U
 
+unsigned long read_cntpct_el0(void) { return 0UL; }
+unsigned long read_cnthp_ctl_el2(void) { return 0UL; }
+unsigned long read_cnthp_cval_el2(void) { return 0UL; }
+void write_cnthp_ctl_el2(unsigned long value) { (void)value; }
+void write_cnthp_cval_el2(unsigned long value) { (void)value; }
+void test_isb(void) {}
+
 static unsigned int current_cpu;
 static unsigned long virtual_control, physical_control;
 static unsigned int pending_intid = 1023U;

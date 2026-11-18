@@ -112,6 +112,25 @@ void host_rmi_realm_activate(void *rd, struct smc_result *res)
 		res);
 }
 
+void host_rmi_opencca_gpu_pm(unsigned long operation, unsigned long argument,
+			     unsigned long error, struct smc_result *res)
+{
+	handle_ns_smc(SMC_RMI_OPENCCA_GPU_PM,
+		operation,
+		argument,
+		error,
+		0, 0, 0,
+		res);
+}
+
+void host_rmi_opencca_gpu_mmio_grant(void *rd, struct smc_result *res)
+{
+	handle_ns_smc(SMC_RMI_OPENCCA_GPU_MMIO_GRANT,
+		(uintptr_t)rd,
+		0, 0, 0, 0, 0,
+		res);
+}
+
 void host_rmi_rec_enter(void *rec, void *run_ptr, struct smc_result *res)
 {
 	handle_ns_smc(SMC_RMI_REC_ENTER,

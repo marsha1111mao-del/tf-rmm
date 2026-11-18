@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 struct gpu_firmware_config;
+struct granule;
 
 #define OPENCCA_GPU_MMIO_BASE 0xfb000000UL
 #define OPENCCA_GPU_MMIO_SIZE 0x200000UL
@@ -50,13 +51,16 @@ struct opencca_gpu_ops {
 bool opencca_gpu_mmio_grant(const void *owner);
 bool opencca_gpu_mmio_allowed(const void *owner);
 bool opencca_gpu_mmio_running(const void *owner);
-bool opencca_gpu_service_running(const void *owner);
-bool opencca_gpu_service_isolated(const void *owner);
+bool opencca_gpu_service_running(const void *owner, unsigned long endpoint_id);
+bool opencca_gpu_service_isolated(const void *owner, unsigned long endpoint_id);
 /* Service-initiated, irreversible until owner teardown. This is a control
  * handoff, not permission to run firmware or launch a private workload.
  */
 bool opencca_gpu_service_isolate(const struct opencca_gpu_ops *ops,
-		const void *owner);
+				 const void *owner, unsigned long endpoint_id);
+void opencca_gpu_service_invalidate(const void *owner);
+void opencca_gpu_service_release_locked(struct granule *owner);
+void opencca_gpu_service_release(struct granule *owner);
 /* RSI adapter: mapping lock + trusted reset + private-context revocation.
  * The caller must hold xshm_policy_lock.
  */
@@ -64,27 +68,35 @@ bool opencca_gpu_isolate_service(const void *owner);
 /* Internal trusted callbacks: no RSI accepts a root HPA or register script. */
 bool opencca_gpu_private_pt_install(unsigned long root, unsigned int slot);
 bool opencca_gpu_private_pt_sync(unsigned long root);
-bool opencca_gpu_private_pt_prepare(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing);
+bool opencca_gpu_private_pt_prepare(unsigned long root, unsigned int slot,
+				    unsigned long firmware_root, bool existing);
 bool opencca_gpu_private_pt_check_running(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, struct gpu_firmware_config *config);
-bool opencca_gpu_private_pt_extend(unsigned long root, unsigned int slot, unsigned long firmware_root);
-bool opencca_gpu_private_pt_flush_live(unsigned long root, unsigned int slot, unsigned long firmware_root);
-bool opencca_gpu_private_pt_detach(unsigned long root, unsigned int slot, unsigned long firmware_root, bool detached);
+					  unsigned long firmware_root,
+					  struct gpu_firmware_config *config);
+bool opencca_gpu_private_pt_extend(unsigned long root, unsigned int slot,
+				   unsigned long firmware_root);
+bool opencca_gpu_private_pt_flush_live(unsigned long root, unsigned int slot,
+				       unsigned long firmware_root);
+bool opencca_gpu_private_pt_detach(unsigned long root, unsigned int slot,
+				   unsigned long firmware_root, bool detached);
 bool opencca_gpu_firmware_install(unsigned long root);
 bool opencca_gpu_firmware_boot(unsigned long root);
-bool opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firmware_config *config);
+bool opencca_gpu_firmware_configuration(unsigned long root,
+					struct gpu_firmware_config *config);
 bool opencca_gpu_firmware_notify(unsigned long root);
+bool opencca_gpu_firmware_queue_notify(unsigned long root, unsigned int csg);
 bool opencca_gpu_mapping_allowed(const void *owner, unsigned long ipa,
-		unsigned long pa, unsigned long size, unsigned long shared_base);
+				 unsigned long pa, unsigned long size,
+				 unsigned long shared_base);
 bool opencca_gpu_authorize_mapping(const void *owner, unsigned long ipa,
-		unsigned long pa, unsigned long size, unsigned long shared_base);
-bool opencca_gpu_claim(const void *owner);
+				   unsigned long pa, unsigned long size,
+				   unsigned long shared_base);
+bool opencca_gpu_claim(const void *owner, unsigned long endpoint_id);
 bool opencca_gpu_control(const struct opencca_gpu_ops *ops, const void *caller,
 			 unsigned long operation, unsigned long argument,
 			 unsigned long error);
 enum opencca_gpu_state opencca_gpu_state(void);
 void opencca_gpu_mmio_release(const void *owner);
-bool opencca_gpu_pm_destroy_blocked(const void *owner);
 bool opencca_gpu_pm_destroy_begin(const void *owner);
 
 bool plat_opencca_gpu_reset(bool preserve_irqs);
@@ -99,13 +111,16 @@ bool plat_opencca_gpu_pt_sync(unsigned long root);
 /* Prepare an unused nonzero Client AS while the trusted MCU remains running.
  * Repeated matching roots are checked without reprogramming a live AS.
  */
-bool plat_opencca_gpu_pt_prepare(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing);
+bool plat_opencca_gpu_pt_prepare(unsigned long root, unsigned int slot,
+				 unsigned long firmware_root, bool existing);
 bool plat_opencca_gpu_pt_check_running(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, struct gpu_firmware_config *config);
+				       unsigned long firmware_root,
+				       struct gpu_firmware_config *config);
 /* Additive leaf publication only: check exact live roots/attributes and no
  * duplicate AS, issue PT flush, then check again. Does not change any root.
  */
-bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot, unsigned long firmware_root);
+bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot,
+				unsigned long firmware_root);
 /* Trusted memory visibility primitive, also used by detach before disabling
  * the AS. Validate the same live roots/configuration around LOCK/FLUSH_MEM;
  * leave translation, queues and ownership intact. This does not establish
@@ -113,16 +128,25 @@ bool plat_opencca_gpu_pt_extend(unsigned long root, unsigned int slot, unsigned 
  * or authorize reuse/reclamation. A future live consumer must prove those
  * separate conditions. Failure may follow partial MMIO: retain all backing.
  */
-bool plat_opencca_gpu_pt_flush_live(unsigned long root, unsigned int slot, unsigned long firmware_root);
+bool plat_opencca_gpu_pt_flush_live(unsigned long root, unsigned int slot,
+				    unsigned long firmware_root);
 /* Only after trusted firmware has stopped every CSG referencing this AS.
  * Flush MEM, clear root/attributes, switch to UNMAPPED and wait for UPDATE.
  * A detached replay checks disabled hardware without writing registers.
  */
-bool plat_opencca_gpu_pt_detach(unsigned long root, unsigned int slot, unsigned long firmware_root, bool detached);
+bool plat_opencca_gpu_pt_detach(unsigned long root, unsigned int slot,
+				unsigned long firmware_root, bool detached);
 /* Internal fixed policy: pinned arch10.8 image, AS0 only, no Client queues. */
 bool plat_opencca_gpu_firmware_install(unsigned long root);
 bool plat_opencca_gpu_firmware_boot(unsigned long root);
-bool plat_opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firmware_config *config);
+bool plat_opencca_gpu_firmware_configuration(
+	unsigned long root, struct gpu_firmware_config *config);
 bool plat_opencca_gpu_firmware_notify(unsigned long root);
+bool plat_opencca_gpu_firmware_queue_notify(unsigned long root,
+					    unsigned int csg);
+bool opencca_gpu_root_statistics(unsigned int selector,
+				 unsigned long values[4]);
+void plat_opencca_gpu_root_statistics(unsigned long values[4]);
+void plat_opencca_gpu_as_statistics(unsigned long values[4]);
 
 #endif

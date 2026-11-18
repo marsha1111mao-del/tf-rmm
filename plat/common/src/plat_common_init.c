@@ -89,7 +89,16 @@ static struct xlat_mmap_region static_regions[TOTAL_MMAP_REGIONS];
  * Although a base table at level -1 when FEAT_LPA2 is enabled only has
  * 16 entries, all tables are allocated a page for simplicity.
  */
-static uint64_t static_s1tt[XLAT_TABLE_ENTRIES * PLAT_CMN_CTX_MAX_XLAT_TABLES]
+#define GPU_CONTROL_LEAF_TABLES (PLAT_CMN_GPU_CONTROL_SLOTS / XLAT_TABLE_ENTRIES)
+#define GPU_CONTROL_STATIC_TABLES (PLAT_CMN_CTX_MAX_XLAT_TABLES - GPU_CONTROL_LEAF_TABLES)
+_Static_assert(PLAT_CMN_CTX_MAX_XLAT_TABLES > GPU_CONTROL_LEAF_TABLES,
+	"Preserve the total original S1 table budget");
+static uint64_t gpu_control_s1tt[GPU_CONTROL_LEAF_TABLES][XLAT_TABLE_ENTRIES]
+	__aligned(XLAT_TABLES_ALIGNMENT);
+/* Only dedicated control leaves are writable. Code, MMIO, ordinary data
+ * mappings and upper tables remain in the original protected RO section.
+ */
+static uint64_t static_s1tt[XLAT_TABLE_ENTRIES * GPU_CONTROL_STATIC_TABLES]
 					__aligned(XLAT_TABLES_ALIGNMENT)
 					__section("xlat_static_tables");
 
@@ -97,6 +106,116 @@ static uint64_t static_s1tt[XLAT_TABLE_ENTRIES * PLAT_CMN_CTX_MAX_XLAT_TABLES]
 static struct xlat_ctx_tbls runtime_tbls;
 static struct xlat_ctx_cfg runtime_xlat_ctx_cfg;
 static struct xlat_ctx runtime_xlat_ctx;
+
+/* The low-VA tables are shared by RMM PEs. The ordinary xlat transient
+ * helpers invalidate only the local PE and cannot retire these aliases alone.
+ */
+static void gpu_control_publish_tte(struct xlat_llt_info *table, uintptr_t va)
+{
+	uint64_t *entry = xlat_get_tte_ptr(table, va);
+
+	assert(entry != NULL);
+	clean_dcache_range((uintptr_t)entry, sizeof(*entry));
+	dsb(ishst);
+	tlbivae2is(TLBI_ADDR(va));
+	dsb(ish);
+	isb();
+}
+
+int plat_cmn_gpu_control_map(unsigned int index, unsigned long pa, void **address)
+{
+	struct xlat_llt_info table;
+	uintptr_t va;
+
+	if (index >= PLAT_CMN_GPU_CONTROL_SLOTS || address == NULL ||
+	    pa == 0UL || !GRANULE_ALIGNED(pa) || pa >= (1UL << 40U) ||
+	    !XLAT_TABLES_CTX_CFG_VALID(&runtime_xlat_ctx))
+		return -EINVAL;
+	va = PLAT_CMN_GPU_CONTROL_BASE + (uintptr_t)index * GRANULE_SIZE;
+	if (xlat_get_llt_from_va(&table, &runtime_xlat_ctx, va) != 0 ||
+	    table.level != 3 || table.table != &gpu_control_s1tt[index / XLAT_TABLE_ENTRIES][0] ||
+	    xlat_map_memory_page_with_attrs(&table, va, pa,
+		XLAT_NG_DATA_ATTR | MT_REALM) != 0)
+		return -EFAULT;
+	gpu_control_publish_tte(&table, va);
+	*address = (void *)va;
+	return 0;
+}
+
+int plat_cmn_gpu_control_unmap(unsigned int index, unsigned long pa)
+{
+	struct xlat_llt_info table;
+	uintptr_t va;
+	uint64_t *entry, descriptor;
+
+	if (index >= PLAT_CMN_GPU_CONTROL_SLOTS || pa == 0UL ||
+	    !GRANULE_ALIGNED(pa) || pa >= (1UL << 40U) ||
+	    !XLAT_TABLES_CTX_CFG_VALID(&runtime_xlat_ctx))
+		return -EINVAL;
+	va = PLAT_CMN_GPU_CONTROL_BASE + (uintptr_t)index * GRANULE_SIZE;
+	if (xlat_get_llt_from_va(&table, &runtime_xlat_ctx, va) != 0 || table.level != 3 ||
+	    table.table != &gpu_control_s1tt[index / XLAT_TABLE_ENTRIES][0])
+		return -EFAULT;
+	entry = xlat_get_tte_ptr(&table, va);
+	if (entry == NULL)
+		return -EFAULT;
+	descriptor = xlat_read_tte(entry);
+	/* A failed earlier installation/unmap may leave an invalid transient
+	 * entry. Still broadcast invalidation before releasing its lifetime hold.
+	 * Never unmap an unexpected valid target or a non-transient entry.
+	 */
+	if (descriptor != TRANSIENT_DESC) {
+		if ((descriptor & (TRANSIENT_DESC | 3UL)) != (TRANSIENT_DESC | 3UL) ||
+		    (descriptor & UINT64_C(0x000000fffffff000)) != pa ||
+		    xlat_unmap_memory_page(&table, va) != 0)
+			return -EFAULT;
+	}
+	gpu_control_publish_tte(&table, va);
+	return 0;
+}
+
+
+static int gpu_control_install_leaf_tables(void)
+{
+	/* Cold boot only, before any PE enables these tables. Select exactly
+	 * the L2 parent of each preallocated, wholly invalid control L3 table.
+	 * Never change runtime permissions of the immutable table pool.
+	 */
+	assert(!is_mmu_enabled());
+	for (unsigned int i = 0U; i < GPU_CONTROL_LEAF_TABLES; i++) {
+		uintptr_t va = PLAT_CMN_GPU_CONTROL_BASE +
+			(uintptr_t)i * XLAT_TABLE_ENTRIES * GRANULE_SIZE;
+		uint64_t *parent = runtime_tbls.tables;
+		struct xlat_llt_info leaf;
+
+		for (int level = runtime_xlat_ctx_cfg.base_level; level < 2; level++) {
+			unsigned int index = (unsigned int)((va >> XLAT_ADDR_SHIFT(level)) &
+				(XLAT_TABLE_ENTRIES - 1U));
+			uint64_t desc = xlat_read_tte(&parent[index]);
+			if ((desc & 3UL) != 3UL) return -EFAULT;
+			parent = (void *)(uintptr_t)(desc & UINT64_C(0x0000fffffffff000));
+		}
+		unsigned int index = (unsigned int)((va >> XLAT_ADDR_SHIFT(2)) &
+			(XLAT_TABLE_ENTRIES - 1U));
+		uint64_t desc = xlat_read_tte(&parent[index]);
+		if ((desc & 3UL) != 3UL ||
+		    xlat_get_llt_from_va(&leaf, &runtime_xlat_ctx, va) != 0 || leaf.level != 3 ||
+		    (uintptr_t)leaf.table != (desc & UINT64_C(0x0000fffffffff000)))
+			return -EFAULT;
+		for (unsigned int j = 0U; j < XLAT_TABLE_ENTRIES; j++) {
+			if (xlat_read_tte(&leaf.table[j]) != TRANSIENT_DESC) return -EFAULT;
+			gpu_control_s1tt[i][j] = TRANSIENT_DESC;
+		}
+		xlat_write_tte(&parent[index],
+			(desc & ~UINT64_C(0x0000fffffffff000)) |
+			(uintptr_t)&gpu_control_s1tt[i][0]);
+	}
+	clean_dcache_range((uintptr_t)gpu_control_s1tt, sizeof(gpu_control_s1tt));
+	clean_dcache_range((uintptr_t)static_s1tt, sizeof(static_s1tt));
+	dsb(sy);
+	return 0;
+}
+
 
 int plat_cmn_init_el3_ifc(unsigned long x0, unsigned long x1,
 			   unsigned long x2, unsigned long x3)
@@ -173,7 +292,7 @@ int plat_cmn_setup(struct xlat_mmap_region *plat_regions,
 	ret = xlat_ctx_init(&runtime_xlat_ctx, &runtime_xlat_ctx_cfg,
 			    &runtime_tbls,
 			    &static_s1tt[0],
-			    PLAT_CMN_CTX_MAX_XLAT_TABLES);
+			    GPU_CONTROL_STATIC_TABLES);
 
 	if (ret != 0) {
 		ERROR("%s (%u): %s (%i)\n",
@@ -182,6 +301,9 @@ int plat_cmn_setup(struct xlat_mmap_region *plat_regions,
 			ret);
 		return ret;
 	}
+
+	ret = gpu_control_install_leaf_tables();
+	if (ret != 0) return ret;
 
 	/* Read supported GIC virtualization features and init GIC variables */
 	gic_get_virt_features();

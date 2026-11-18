@@ -313,6 +313,13 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	plat_opencca_timers_save();
 #endif
 	restore_realm_state(rec);
+#if ENABLE_OPENCCA
+	/* OpenCCA shares CNTP with NS: keep the Host deadline live while the
+	 * Realm owns EL1 timer registers, including during fast IRQ re-entry.
+	 */
+	plat_opencca_host_timer_start(ns_state->sysregs.cntp_ctl_el0,
+				      ns_state->sysregs.cntp_cval_el0);
+#endif
 
 	/*
 	 * The run loop must be entered with active SIMD context set to current
@@ -331,7 +338,8 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 		 * change in output level to the NS caller.
 		 */
 		#if ENABLE_OPENCCA
-		if (opencca_check_pending_timers(rec)) {
+		if (plat_opencca_host_timer_expired() ||
+		    opencca_check_pending_timers(rec)) {
 		#else
 		if (check_pending_timers(rec)) {
 		#endif
@@ -390,6 +398,9 @@ void rec_run_loop(struct rec *rec, struct rmi_rec_exit *rec_exit)
 	report_timer_state_to_ns(rec_exit);
 
 	save_realm_state(rec, rec_exit);
+#if ENABLE_OPENCCA
+	plat_opencca_host_timer_stop();
+#endif
 	restore_ns_state(rec);
 #if ENABLE_OPENCCA
 	plat_opencca_timers_restore();

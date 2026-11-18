@@ -9,7 +9,7 @@
 
 bool xshm_irq_host_valid(const unsigned long *lrs, size_t count)
 {
-	if (lrs == NULL || count < 2U || lrs[count - 1U] != 0UL)
+	if (lrs == NULL || count < 1U || lrs[count - 1U] != 0UL)
 		return false;
 	for (size_t i = 0U; i < count - 1U; i++) {
 		if ((lrs[i] & LR_STATE) != 0UL &&

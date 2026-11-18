@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <opencca_gpu_lease.h>
 #include <opencca_gpu_private.h>
+#include <opencca_gpu_role.h>
 #include <opencca_iommu.h>
 #include <realm.h>
 #include <rsi-handler.h>
@@ -18,6 +19,7 @@
 #include <smc-handler.h>
 #include <spinlock.h>
 #include <string.h>
+#include <xshm_endpoint.h>
 #include <xshm_runtime.h>
 
 #define OPENCCA_GPA_TO_HPA_MAX_ENTRIES (GRANULE_SIZE / sizeof(unsigned long))
@@ -51,8 +53,10 @@ unsigned long smc_opencca_dma_guard(unsigned long op, unsigned long domain,
 		    ((pa | size) & (GRANULE_SIZE - 1UL)) != 0UL ||
 		    size > ULONG_MAX - pa)
 			return RMI_ERROR_INPUT;
-		for (unsigned long offset = 0UL; offset < size; offset += GRANULE_SIZE) {
-			struct granule *g = find_lock_granule(pa + offset, GRANULE_STATE_NS);
+		for (unsigned long offset = 0UL; offset < size;
+		     offset += GRANULE_SIZE) {
+			struct granule *g = find_lock_granule(pa + offset,
+							      GRANULE_STATE_NS);
 
 			if (g == NULL)
 				return RMI_ERROR_INPUT;
@@ -90,7 +94,7 @@ bool opencca_gpu_page_busy(unsigned long hpa)
 }
 
 bool opencca_gpu_dma_reserve(unsigned long domain, unsigned long iova,
-			    unsigned long pa, unsigned long size)
+			     unsigned long pa, unsigned long size)
 {
 	bool accepted;
 
@@ -101,7 +105,7 @@ bool opencca_gpu_dma_reserve(unsigned long domain, unsigned long iova,
 }
 
 bool opencca_gpu_dma_retire(unsigned long domain, unsigned long iova,
-			   unsigned long size)
+			    unsigned long size)
 {
 	bool accepted;
 
@@ -119,7 +123,8 @@ void smc_opencca_dma_status(unsigned long selector, struct smc_result *res)
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	if (selector == 0UL) {
 		res->x[1] = 1UL; /* ABI version */
-		res->x[2] = 0UL; /* No claim of immutable hardware enforcement. */
+		res->x[2] =
+			0UL; /* No claim of immutable hardware enforcement. */
 	} else if (selector == 1UL) {
 		res->x[1] = opencca_gpu_lease_active();
 		res->x[2] = opencca_gpu_lease_first();
@@ -149,12 +154,14 @@ unsigned long smc_opencca_gpu_mmio_grant(unsigned long rd_addr)
 }
 
 bool opencca_gpu_authorize_mapping(const void *owner, unsigned long ipa,
-		unsigned long pa, unsigned long size, unsigned long shared_base)
+				   unsigned long pa, unsigned long size,
+				   unsigned long shared_base)
 {
 	bool allowed;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	allowed = opencca_gpu_mapping_allowed(owner, ipa, pa, size, shared_base);
+	allowed =
+		opencca_gpu_mapping_allowed(owner, ipa, pa, size, shared_base);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return allowed;
 }
@@ -168,6 +175,32 @@ static const struct opencca_gpu_ops gpu_ops = {
 	.opp_valid = plat_opencca_gpu_opp_valid
 };
 
+static void opencca_gpu_role_claim_measure(struct granule *g_rd,
+					   unsigned long endpoint_id)
+{
+	struct rd *rd;
+
+	granule_lock(g_rd, GRANULE_STATE_RD);
+	rd = buffer_granule_map(g_rd, SLOT_RD);
+	assert(rd != NULL);
+	opencca_gpu_role_measure(
+		rd->algorithm, endpoint_id,
+		rd->measurement[OPENCCA_GPU_ROLE_MEASUREMENT_SLOT]);
+	buffer_unmap(rd);
+	granule_unlock(g_rd);
+}
+
+static void opencca_gpu_role_claim_clear_locked(struct granule *g_rd)
+{
+	struct rd *rd;
+
+	rd = buffer_granule_map(g_rd, SLOT_RD);
+	assert(rd != NULL);
+	opencca_gpu_role_clear(
+		rd->measurement[OPENCCA_GPU_ROLE_MEASUREMENT_SLOT]);
+	buffer_unmap(rd);
+}
+
 bool opencca_gpu_isolate_service(const void *service)
 {
 	bool accepted, already_isolated;
@@ -176,8 +209,10 @@ bool opencca_gpu_isolate_service(const void *service)
 	 * Do not retain the mapping lock while clearing private PT references.
 	 */
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	already_isolated = opencca_gpu_service_isolated(service);
-	accepted = opencca_gpu_service_isolate(&gpu_ops, service);
+	already_isolated = opencca_gpu_service_isolated(
+		service, xshm_endpoint_id(service));
+	accepted = opencca_gpu_service_isolate(&gpu_ops, service,
+					       xshm_endpoint_id(service));
 	spinlock_release(&opencca_gpu_mappings_lock);
 	if (accepted && !already_isolated)
 		opencca_gpu_private_device_revoked();
@@ -190,7 +225,7 @@ bool opencca_gpu_private_pt_install(unsigned long root, unsigned int slot)
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	installed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_install(root, slot);
+		    plat_opencca_gpu_pt_install(root, slot);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return installed;
 }
@@ -201,52 +236,58 @@ bool opencca_gpu_private_pt_sync(unsigned long root)
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	synchronized = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_sync(root);
+		       plat_opencca_gpu_pt_sync(root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return synchronized;
 }
 
-bool opencca_gpu_private_pt_prepare(unsigned long root, unsigned int slot, unsigned long firmware_root, bool existing)
+bool opencca_gpu_private_pt_prepare(unsigned long root, unsigned int slot,
+				    unsigned long firmware_root, bool existing)
 {
 	bool prepared;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	prepared = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_prepare(root, slot, firmware_root, existing);
+		   plat_opencca_gpu_pt_prepare(root, slot, firmware_root,
+					       existing);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return prepared;
 }
 
 bool opencca_gpu_private_pt_check_running(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, struct gpu_firmware_config *config)
+					  unsigned long firmware_root,
+					  struct gpu_firmware_config *config)
 {
 	bool checked;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	checked = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_check_running(root, slot, firmware_root, config);
+		  plat_opencca_gpu_pt_check_running(root, slot, firmware_root,
+						    config);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return checked;
 }
 
-bool opencca_gpu_private_pt_extend(unsigned long root, unsigned int slot, unsigned long firmware_root)
+bool opencca_gpu_private_pt_extend(unsigned long root, unsigned int slot,
+				   unsigned long firmware_root)
 {
 	bool extended;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	extended = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_extend(root, slot, firmware_root);
+		   plat_opencca_gpu_pt_extend(root, slot, firmware_root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return extended;
 }
 
 bool opencca_gpu_private_pt_detach(unsigned long root, unsigned int slot,
-		unsigned long firmware_root, bool detached)
+				   unsigned long firmware_root, bool detached)
 {
 	bool stopped;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	stopped = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+	stopped =
+		opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
 		plat_opencca_gpu_pt_detach(root, slot, firmware_root, detached);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return stopped;
@@ -258,19 +299,19 @@ bool opencca_gpu_firmware_install(unsigned long root)
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	installed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_firmware_install(root);
+		    plat_opencca_gpu_firmware_install(root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return installed;
 }
 
 bool opencca_gpu_private_pt_flush_live(unsigned long root, unsigned int slot,
-		unsigned long firmware_root)
+				       unsigned long firmware_root)
 {
 	bool flushed;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	flushed = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_pt_flush_live(root, slot, firmware_root);
+		  plat_opencca_gpu_pt_flush_live(root, slot, firmware_root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return flushed;
 }
@@ -281,18 +322,19 @@ bool opencca_gpu_firmware_boot(unsigned long root)
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	booted = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_firmware_boot(root);
+		 plat_opencca_gpu_firmware_boot(root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return booted;
 }
 
-bool opencca_gpu_firmware_configuration(unsigned long root, struct gpu_firmware_config *config)
+bool opencca_gpu_firmware_configuration(unsigned long root,
+					struct gpu_firmware_config *config)
 {
 	bool configured;
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	configured = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_firmware_configuration(root, config);
+		     plat_opencca_gpu_firmware_configuration(root, config);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return configured;
 }
@@ -303,13 +345,40 @@ bool opencca_gpu_firmware_notify(unsigned long root)
 
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	notified = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
-		plat_opencca_gpu_firmware_notify(root);
+		   plat_opencca_gpu_firmware_notify(root);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	return notified;
 }
 
+bool opencca_gpu_firmware_queue_notify(unsigned long root, unsigned int csg)
+{
+	bool notified;
+
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	notified = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		   plat_opencca_gpu_firmware_queue_notify(root, csg);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return notified;
+}
+
+bool opencca_gpu_root_statistics(unsigned int selector, unsigned long values[4])
+{
+	bool permitted;
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	permitted = opencca_gpu_state() == OPENCCA_GPU_MEDIATED &&
+		    (selector == 3U || selector == 4U);
+	if (permitted) {
+		if (selector == 3U)
+			plat_opencca_gpu_root_statistics(values);
+		else
+			plat_opencca_gpu_as_statistics(values);
+	}
+	spinlock_release(&opencca_gpu_mappings_lock);
+	return permitted;
+}
+
 void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
-		       unsigned long error, struct smc_result *res)
+			unsigned long error, struct smc_result *res)
 {
 	bool accepted, was_mediated;
 
@@ -334,7 +403,8 @@ void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
 	}
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	was_mediated = opencca_gpu_state() == OPENCCA_GPU_MEDIATED;
-	accepted = opencca_gpu_control(&gpu_ops, NULL, operation, argument, error);
+	accepted =
+		opencca_gpu_control(&gpu_ops, NULL, operation, argument, error);
 	res->x[0] = accepted ? RMI_SUCCESS : RMI_ERROR_INPUT;
 	res->x[1] = opencca_gpu_state();
 	if (accepted && operation == OPENCCA_GPU_STATUS) {
@@ -351,13 +421,14 @@ void smc_opencca_gpu_pm(unsigned long operation, unsigned long argument,
 	 * again; a successful hardware reset has removed all installed roots.
 	 */
 	if (accepted && (operation == OPENCCA_GPU_RELEASE ||
-		(was_mediated && operation == OPENCCA_GPU_RESET)))
+			 (was_mediated && operation == OPENCCA_GPU_RESET)))
 		opencca_gpu_private_device_revoked();
 }
 
 void handle_rsi_opencca_gpu_control(struct rec *rec, struct rsi_result *res)
 {
 	unsigned long operation = rec->regs[1];
+	unsigned long endpoint_id = 0UL;
 	bool accepted = false;
 
 	res->action = UPDATE_REC_RETURN_TO_REALM;
@@ -367,14 +438,41 @@ void handle_rsi_opencca_gpu_control(struct rec *rec, struct rsi_result *res)
 		if (rec->regs[i] != 0UL)
 			return;
 	}
+	if (operation == 0UL)
+		xshm_policy_lock();
+	if (operation == 0UL)
+		endpoint_id = xshm_endpoint_id(rec->realm_info.g_rd);
 	spinlock_acquire(&opencca_gpu_mappings_lock);
 	if (operation == 0UL)
-		accepted = opencca_gpu_claim(rec->realm_info.g_rd);
+		accepted = opencca_gpu_claim(rec->realm_info.g_rd, endpoint_id);
 	else if (operation == 1UL)
 		accepted = opencca_gpu_control(&gpu_ops, rec->realm_info.g_rd,
-					      OPENCCA_GPU_RESET, 0UL, 0UL);
+					       OPENCCA_GPU_RESET, 0UL, 0UL);
 	res->smc_res.x[0] = accepted ? RSI_SUCCESS : RSI_ERROR_INPUT;
 	spinlock_release(&opencca_gpu_mappings_lock);
+	if (accepted && operation == 0UL)
+		opencca_gpu_role_claim_measure(rec->realm_info.g_rd,
+					       endpoint_id);
+	if (operation == 0UL)
+		xshm_policy_unlock();
+}
+
+void opencca_gpu_service_release_locked(struct granule *owner)
+{
+	spinlock_acquire(&opencca_gpu_mappings_lock);
+	opencca_gpu_service_invalidate(owner);
+	spinlock_release(&opencca_gpu_mappings_lock);
+	if (owner != NULL)
+		opencca_gpu_role_claim_clear_locked(owner);
+}
+
+void opencca_gpu_service_release(struct granule *owner)
+{
+	if (owner == NULL)
+		return;
+	granule_lock(owner, GRANULE_STATE_RD);
+	opencca_gpu_service_release_locked(owner);
+	granule_unlock(owner);
 }
 
 bool opencca_gpu_pm_destroy_allowed(struct granule *g_rd)
@@ -387,9 +485,9 @@ bool opencca_gpu_pm_destroy_allowed(struct granule *g_rd)
 	return allowed;
 }
 
-static enum s2_walk_status opencca_gpu_ipa_to_pa(struct rec *rec,
-		unsigned long ipa, unsigned long *pa, unsigned long *rtt_level,
-		enum ripas *ripas)
+static enum s2_walk_status
+opencca_gpu_ipa_to_pa(struct rec *rec, unsigned long ipa, unsigned long *pa,
+		      unsigned long *rtt_level, enum ripas *ripas)
 {
 	struct s2_walk_result walk;
 	enum s2_walk_status status = realm_ipa_to_pa(rec, ipa, &walk);
@@ -408,8 +506,8 @@ static enum s2_walk_status opencca_gpu_ipa_to_pa(struct rec *rec,
  * No outputs are published before all translations/leases have succeeded.
  */
 static bool access_array(struct rec *rec, unsigned long array_ipa,
-		unsigned long *batch, unsigned long count, bool write,
-		struct rsi_result *res)
+			 unsigned long *batch, unsigned long count, bool write,
+			 struct rsi_result *res)
 {
 	struct s2_walk_result walk;
 	enum s2_walk_status status = realm_ipa_to_pa(rec, array_ipa, &walk);
@@ -492,7 +590,8 @@ void handle_rsi_opencca_gpa_to_hpa(struct rec *rec, struct rsi_result *res)
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
 			goto out;
 		}
-		status = opencca_gpu_ipa_to_pa(rec, ipa, &batch[i], &level, &ripas);
+		status = opencca_gpu_ipa_to_pa(rec, ipa, &batch[i], &level,
+					       &ripas);
 		if (status == WALK_INVALID_PARAMS ||
 		    (status == WALK_FAIL && ripas == RIPAS_EMPTY)) {
 			res->smc_res.x[0] = RSI_ERROR_INPUT;
@@ -505,7 +604,8 @@ void handle_rsi_opencca_gpa_to_hpa(struct rec *rec, struct rsi_result *res)
 		}
 	}
 	spinlock_acquire(&opencca_gpu_mappings_lock);
-	acquired = opencca_gpu_lease_acquire(rec->realm_info.g_rd, batch, count);
+	acquired =
+		opencca_gpu_lease_acquire(rec->realm_info.g_rd, batch, count);
 	spinlock_release(&opencca_gpu_mappings_lock);
 	if (!acquired) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;

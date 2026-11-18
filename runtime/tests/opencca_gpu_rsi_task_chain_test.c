@@ -7,6 +7,7 @@
 
 static unsigned long task_contexts[2], task_bos[2], task_groups[2], task_tokens[2];
 static unsigned long task_roots[2], task_arena;
+static unsigned long task_versions[2];
 static unsigned int task_fault_case, task_fault_countdown;
 static uint32_t *task_fault_word, task_fault_saved;
 static unsigned int task_cpu_returns[2];
@@ -97,10 +98,27 @@ static void task_create(unsigned int c)
 	memset(chain_cpu[c][1], 0x70 + c, 4096);
 	memset(chain_cpu[c][2], 0x78 + c, 4096);
 	unsigned long prot = GPU_PRIVATE_READ | GPU_PRIVATE_WRITE | GPU_PRIVATE_EXEC | GPU_PRIVATE_CACHE;
-	r = chain_call(c, GPU_PRIVATE_MAP_AUTHORIZE, task_contexts[c], task_bos[c], 0, 0x800000UL, 2, prot);
-	chain_success(r);
-	chain_success(chain_call(2, GPU_PRIVATE_SERVICE_MAP, task_contexts[c], chain_channels[c], r.value[0], 0,
-		0x800000UL, (2UL << 8U) | prot));
+	if (c == 0U) {
+		struct gpu_private_result version = chain_call(c, GPU_PRIVATE_MAPPING_VERSION,
+			task_contexts[c], 0, 0, 0, 0, 0);
+		chain_success(version);
+		struct gpu_private_map_request map = { .request_id = 1UL,
+			.version = version.value[0], .object = task_bos[c],
+			.iova = 0x800000UL, .count = 2UL, .prot = prot };
+		memcpy(chain_device[c][0], &map, sizeof(map));
+		r = chain_call(c, GPU_PRIVATE_MAP_BEGIN, task_contexts[c], INPUT_IPA, 0, 0, 0, 0);
+		unsigned int steps = 0U;
+		while (r.status == GPU_PRIVATE_INCOMPLETE) {
+			chain_expect(++steps <= 3U, "bounded direct-map continuation");
+			r = chain_call(c, GPU_PRIVATE_MAP_STEP, r.value[0], r.value[2], 0, 0, 0, 0);
+		}
+		chain_success(r);
+	} else {
+		r = chain_call(c, GPU_PRIVATE_MAP_AUTHORIZE, task_contexts[c], task_bos[c], 0, 0x800000UL, 2, prot);
+		chain_success(r);
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_MAP, task_contexts[c], chain_channels[c], r.value[0], 0,
+			0x800000UL, (2UL << 8U) | prot));
+	}
 	for (unsigned int p = 0; p < 2; p++)
 		chain_expect(chain_leaf(task_roots[c], 0x800000UL + p * 4096UL) == chain_data[c][p + 1U].pa,
 			"task GPU root maps only its Client data");
@@ -119,17 +137,41 @@ static void task_create(unsigned int c)
 	};
 	memcpy(chain_device[c][0], commands, sizeof(commands));
 	memset(chain_cpu[c][0], 0x20, 4096); chain_mutate = true;
+	chain_cpu[c][1][7] = 0U; chain_cpu[c][2][7] = 0U;
+	chain_device[c][1][7] = 0U; chain_device[c][2][7] = 0U;
 	r = chain_call(c, GPU_PRIVATE_TASK_STAGE_BATCH, task_groups[c], INPUT_IPA, chain_channels[c], 2,
-		GPU_PRIVATE_TASK_DEFERRED | GPU_PRIVATE_TASK_DELEGATE, 0);
+		GPU_PRIVATE_TASK_DEFERRED | GPU_PRIVATE_TASK_DELEGATE |
+		(c == 0U ? GPU_PRIVATE_TASK_MAPPING_VERSION : 0UL), 0);
 	chain_success(r); task_tokens[c] = r.value[0];
+	task_versions[c] = r.value[3];
+	struct gpu_private_result version = chain_call(c, GPU_PRIVATE_MAPPING_VERSION,
+		task_contexts[c], 0, 0, 0, 0, 0);
+	chain_success(version);
+	chain_expect(c == 0U ? task_versions[c] == version.value[0] && task_versions[c] != 0UL :
+		task_versions[c] == 0UL, "stage returns exact held version; legacy keeps zero");
 	chain_expect(!chain_mutate && r.value[1] == 2 && r.value[2] == 3, "task snapshot binds both queue members");
+	struct gpu_private_result observation = chain_call(c, GPU_PRIVATE_TASK_OBSERVATION,
+		task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_success(observation);
+	chain_expect(observation.value[0] == 0UL && observation.value[1] == 0UL &&
+		observation.value[2] == 0UL && observation.value[3] == task_tokens[c],
+		"unstarted task has no trusted execution observation");
+	struct gpu_private_result provider = chain_call(2U, GPU_PRIVATE_TASK_OBSERVATION,
+		task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_success(provider);
+	chain_expect(memcmp(observation.value, provider.value, sizeof(observation.value)) == 0,
+		"actual service reads the same owner-bound observation metadata");
+	chain_denied(chain_call(1U - c, GPU_PRIVATE_TASK_OBSERVATION, task_tokens[c],
+		chain_channels[1U - c], 0, 0, 0, 0));
+	chain_denied(chain_call(c, GPU_PRIVATE_TASK_OBSERVATION, task_tokens[c],
+		chain_channels[c], 1, 0, 0, 0));
 }
 
 static void task_launch(unsigned int c)
 {
 	unsigned int before = chain_flushes;
 	chain_success(chain_call(2, GPU_PRIVATE_TASK_DISPATCH, task_tokens[c], chain_channels[c],
-		task_contexts[c], task_groups[c], 0, 0));
+		task_contexts[c], task_groups[c], task_versions[c], 0));
 	chain_expect(chain_flushes == before + 2U, "READY flushes actual two Client pages");
 	chain_expect(chain_device[c][1][0] == 0x70 + c && chain_device[c][2][0] == 0x78 + c,
 		"READY sends private CPU input to correct device backing");
@@ -147,6 +189,95 @@ static void task_bad_requests(unsigned int c)
 	chain_denied(chain_call(c, GPU_PRIVATE_TASK_RETURN, task_tokens[c], chain_channels[c], 0, 0, 0, 0));
 	chain_denied(chain_call(c, GPU_PRIVATE_TASK_RETIRE, task_tokens[c], chain_channels[c], 0, 0, 0, 0));
 	chain_expect(writes == written && chain_cleans == cleaned, "identity/early completion denials never publish or return data");
+}
+
+static struct smc_result task_pm(unsigned long operation, unsigned long argument,
+	unsigned long error);
+
+static void task_compromised_proxy_equivalent_controls(unsigned int c)
+{
+	const unsigned int written = writes, cleaned = chain_cleans;
+	const unsigned int invalidated = chain_invalidates, flushed = chain_flushes;
+	struct gpu_private_result r;
+	struct rec rec = {.realm_info = {&chain_owners[2], chain_rd[2].s2_ctx},
+		.regs = {0, 1}};
+	struct rsi_result control = {0};
+	struct smc_result pm;
+
+	r = chain_call(2, GPU_PRIVATE_GROUP_INSPECT, task_groups[c],
+		chain_channels[c], 0, 0, 0, 0);
+	chain_success(r);
+	r = chain_call(2, GPU_PRIVATE_TASK_VALIDATE, task_tokens[c],
+		chain_channels[c], task_contexts[c], task_groups[c], 0, 0);
+	chain_denied(r);
+	chain_denied(chain_call(2, GPU_PRIVATE_TASK_DISPATCH, task_tokens[c],
+		chain_channels[c], task_contexts[c], task_groups[c], task_versions[c], 0));
+	chain_denied(chain_call(1U - c, GPU_PRIVATE_TASK_FINISH, task_tokens[c],
+		chain_channels[1U - c], 0, 0, 0, 0));
+	chain_denied(chain_call(c, GPU_PRIVATE_TASK_RETURN, task_tokens[c],
+		chain_channels[c], 0, 0, 0, 0));
+	chain_denied(chain_call(c, GPU_PRIVATE_TASK_RETIRE, task_tokens[c],
+		chain_channels[c], 0, 0, 0, 0));
+	chain_denied(chain_call(2, GPU_PRIVATE_SERVICE_MAP, task_contexts[c],
+		chain_channels[c], 1, 0, 0x800000UL, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE));
+	chain_denied(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, task_contexts[c],
+		chain_channels[c], 0x800000UL, 2, 0, 0));
+	xshm_policy_lock();
+	handle_rsi_opencca_gpu_control(&rec, &control);
+	xshm_policy_unlock();
+	chain_balanced();
+	chain_expect(control.action == UPDATE_REC_RETURN_TO_REALM &&
+		control.smc_res.x[0] == RSI_ERROR_INPUT,
+		"compromised Proxy cannot use native control reset as an equivalent path");
+	pm = task_pm(OPENCCA_GPU_RESET, 1UL, 0UL);
+	chain_expect(pm.x[0] == RMI_ERROR_INPUT,
+		"malformed Host reset cannot bypass mediated revocation");
+	chain_expect(!opencca_gpu_mapping_allowed(&chain_owners[2], 0x80fb000000UL,
+		0xfb000000UL, 0x200000UL, 0x8000000000UL),
+		"compromised Proxy cannot reinstall raw MMIO/DMA control");
+	chain_expect(writes == written && chain_cleans == cleaned &&
+		chain_invalidates == invalidated && chain_flushes == flushed &&
+		!task_cpu_returns[c] && !task_cpu_returns[1U - c] &&
+		chain_cpu[c][1][0] == 0x70 + c && chain_cpu[c][2][0] == 0x78 + c,
+		"all equivalent control denials leave both Clients' data and completion isolated");
+}
+
+static void task_completion_semantics(unsigned int c)
+{
+	uint32_t * const output = model_groups[c].cs_output[0];
+	const unsigned int returns_before = task_cpu_returns[c];
+	struct gpu_private_result r;
+
+	r = chain_call(c, GPU_PRIVATE_TASK_PROGRESS, task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_success(r);
+	chain_expect(r.value[0] == 3UL && r.value[1] == 2UL && r.value[2] == 3UL,
+		"fresh two-queue progress reports exact member and queue state");
+	/* A tiler-OOM event is real device state, but it is only a recoverable
+	 * heap request. It is neither completion authority nor a queue shortcut.
+	 */
+	output[0] |= 1U << 26U;
+	output[48] = 5U;
+	output[49] = 3U;
+	output[51] = 1U;
+	output[52] = 0x100000U;
+	r = chain_call(c, GPU_PRIVATE_TASK_HEAP_EVENT, task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_success(r);
+	chain_expect(r.value[0] && r.value[1] == 0x100000UL &&
+		r.value[2] == (4UL | (2UL << 32U)) && r.value[3] == 0U,
+		"OOM event reports exact pending heap and queue semantics");
+	unsigned long event = r.value[0];
+	r = chain_call(c, GPU_PRIVATE_TASK_FINISH, task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_expect(r.status == GPU_PRIVATE_INCOMPLETE && task_cpu_returns[c] == returns_before,
+		"OOM hint or partial IRQ cannot complete or return either queue");
+	r = chain_call(c, GPU_PRIVATE_TASK_HEAP_GROW, task_tokens[c], chain_channels[c], event, 0, 0, 0);
+	chain_expect(r.status == GPU_PRIVATE_INCOMPLETE || r.status == GPU_PRIVATE_SUCCESS,
+		"bounded native-ENOMEM recovery continues from the exact event");
+	output[0] &= ~(1U << 26U);
+	model_groups[c].cs_input[0][0] &= ~(1U << 26U);
+	r = chain_call(c, GPU_PRIVATE_TASK_PROGRESS, task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+	chain_success(r);
+	chain_expect(r.value[0] == 3UL && r.value[1] == 2UL && r.value[2] == 3UL,
+		"late or absent hint cannot replace fresh complete two-queue state");
 }
 
 static void task_finish_one(unsigned int c)
@@ -172,7 +303,26 @@ static void task_finish_one(unsigned int c)
 	chain_expect(writes == written && chain_cleans == cleaned && chain_invalidates == invalidated,
 		"retired token cannot reuse completion or touch backing");
 	chain_success(chain_call(c, GPU_PRIVATE_GROUP_DESTROY, task_groups[c], 0, 0, 0, 0, 0));
-	chain_success(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, task_contexts[c], chain_channels[c], 0x800000UL, 2, 0, 0));
+	if (c == 0U) {
+		/* The former Proxy cleanup is deliberately forbidden in direct mode. */
+		chain_denied(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, task_contexts[c], chain_channels[c], 0x800000UL, 2, 0, 0));
+		struct gpu_private_result version = chain_call(c, GPU_PRIVATE_MAPPING_VERSION,
+			task_contexts[c], 0, 0, 0, 0, 0);
+		chain_success(version);
+		struct gpu_private_map_request map = { .request_id = 2UL,
+			.version = version.value[0], .iova = 0x800000UL, .count = 2UL };
+		memcpy(chain_device[c][0], &map, sizeof(map));
+		struct gpu_private_result unmapped = chain_call(c, GPU_PRIVATE_MAP_BEGIN,
+			task_contexts[c], INPUT_IPA, 0, 0, 0, 0);
+		unsigned int steps = 0U;
+		while (unmapped.status == GPU_PRIVATE_INCOMPLETE) {
+			chain_expect(++steps <= 3U, "bounded direct unmap continuation");
+			unmapped = chain_call(c, GPU_PRIVATE_MAP_STEP, unmapped.value[0], unmapped.value[2], 0, 0, 0, 0);
+		}
+		chain_success(unmapped);
+	} else {
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, task_contexts[c], chain_channels[c], 0x800000UL, 2, 0, 0));
+	}
 	chain_success(chain_call(c, GPU_PRIVATE_CONTEXT_DESTROY, task_contexts[c], 0, 0, 0, 0, 0));
 	chain_success(chain_call(c, GPU_PRIVATE_BO_DESTROY, task_bos[c], 0, 0, 0, 0, 0));
 }
@@ -188,6 +338,12 @@ static void task_finish_fault(void)
 	chain_expect(task_fault_countdown == 0U && task_fault_word != NULL,
 		"post-snapshot device corruption actually injected");
 	chain_expect(r.status == GPU_PRIVATE_STATE && !r.value[0], "post-read fault cannot complete task");
+	struct gpu_private_result observation = chain_call(0U, GPU_PRIVATE_TASK_OBSERVATION,
+		task_tokens[0], chain_channels[0], 0, 0, 0, 0);
+	chain_success(observation);
+	chain_expect(observation.value[0] != 0UL && observation.value[1] == 5UL &&
+		(observation.value[2] & GPU_PRIVATE_OBSERVATION_FAILED) != 0UL &&
+		observation.value[3] == task_tokens[0], "RSI exposes the first trusted failed observation");
 	chain_expect(!task_cpu_returns[0] && chain_cpu[0][1][0] == 0x70 && chain_cpu[0][2][0] == 0x78,
 		"failed task does not return device output");
 	unsigned int written = writes, cleaned = chain_cleans, invalidated = chain_invalidates;
@@ -204,6 +360,36 @@ static void task_finish_fault(void)
 	/* Remove only the injected device-double fault. Protected quarantine and
 	 * references survive until the explicit trusted reset below. */
 	*task_fault_word = task_fault_saved;
+	struct gpu_private_result retained = chain_call(0U, GPU_PRIVATE_TASK_OBSERVATION,
+		task_tokens[0], chain_channels[0], 0, 0, 0, 0);
+	chain_success(retained);
+	chain_expect(memcmp(retained.value, observation.value, sizeof(retained.value)) == 0,
+		"clearing device-double state cannot erase trusted observation history");
+}
+
+static void task_colluded_cross_owner_hint(void)
+{
+	const unsigned int returns_before = task_cpu_returns[1];
+	const unsigned int written = writes, cleaned = chain_cleans;
+	const unsigned int invalidated = chain_invalidates, flushed = chain_flushes;
+	unsigned long hint[4];
+	struct gpu_private_result r;
+
+	chain_denied(chain_call(1U, GPU_PRIVATE_TASK_FINISH, task_tokens[0],
+		chain_channels[1], 0, 0, 0, 0));
+	chain_expect(task_cpu_returns[0] == 0U && task_cpu_returns[1] == returns_before &&
+		writes == written && chain_cleans == cleaned &&
+		chain_invalidates == invalidated && chain_flushes == flushed,
+		"colluding owner cannot replay A completion for A or B");
+	chain_expect(xshm_endpoint_call(&chain_owners[1], XSHM_ACK_ARM,
+		chain_channels[1], 0U, hint) == XSHM_SUCCESS &&
+		xshm_endpoint_call(&chain_owners[2], XSHM_NOTIFY,
+		chain_channels[1], 0U, hint) == XSHM_SUCCESS && (hint[2] & 1UL) != 0UL,
+		"Proxy can inject an unbound late wake hint to B");
+	r = chain_call(1U, GPU_PRIVATE_TASK_PROGRESS, task_tokens[1], chain_channels[1], 0, 0, 0, 0);
+	chain_success(r);
+	chain_expect(r.value[0] == 3UL && r.value[1] == 2UL && r.value[2] == 3UL,
+		"B succeeds only from fresh own two-queue state");
 }
 
 static struct smc_result task_pm(unsigned long operation, unsigned long argument, unsigned long error)
@@ -235,6 +421,37 @@ static void task_destroy_arena(void)
 	for (unsigned int p = 9; p < CHAIN_PAGES; p++)
 		chain_expect((*chain_entry(2, p) & 4095UL) == 0x3fUL,
 			"revoked arena CPU mapping restored only after scrub");
+}
+
+static void task_recover_after_fault(const char *firmware_path)
+{
+	chain_denied(chain_call(0, GPU_PRIVATE_TASK_FINISH, task_tokens[0],
+		chain_channels[0], 0, 0, 0, 0));
+	chain_success(chain_call(0, GPU_PRIVATE_CONTEXT_DESTROY, task_contexts[0],
+		0, 0, 0, 0, 0));
+	chain_success(chain_call(0, GPU_PRIVATE_BO_DESTROY, task_bos[0], 0, 0, 0, 0, 0));
+	task_destroy_arena();
+	task_upload(firmware_path);
+	task_create(0);
+	task_launch(0);
+	task_finish_one(0);
+}
+
+static void task_reset_completion_is_not_job_completion(void)
+{
+	for (unsigned int c = 0; c < 2; c++) {
+		const unsigned int returns_before = task_cpu_returns[c];
+		const unsigned int written = writes, cleaned = chain_cleans;
+		const unsigned int invalidated = chain_invalidates, flushed = chain_flushes;
+		struct gpu_private_result result = chain_call(c, GPU_PRIVATE_TASK_FINISH,
+			task_tokens[c], chain_channels[c], 0, 0, 0, 0);
+
+		chain_expect(result.status != GPU_PRIVATE_SUCCESS &&
+			task_cpu_returns[c] == returns_before &&
+			writes == written && chain_cleans == cleaned &&
+			chain_invalidates == invalidated && chain_flushes == flushed,
+			"device reset completion is not old task completion");
+	}
 }
 
 static struct smc_result task_reclaim(unsigned long address, unsigned long error)
@@ -387,10 +604,26 @@ static void task_revocation(const char *firmware)
 	for (unsigned int i = 0; i < 2; i++) {
 		struct smc_result result = task_pm(OPENCCA_GPU_RESET, i == 0U ? 1UL : 0UL, i == 1U ? 1UL : 0UL);
 		chain_expect(result.x[0] == RMI_ERROR_INPUT && writes == written &&
-			opencca_gpu_service_isolated(&chain_owners[2]) &&
+				opencca_gpu_service_isolated(&chain_owners[2],
+					xshm_endpoint_id(&chain_owners[2])) &&
 			chain_cleans == cleaned && chain_invalidates == invalidated,
 			"malformed Host reset rejected without side effects");
 	}
+	for (unsigned int i = 0; i < 3; i++) {
+		unsigned long operation = i == 0U ? OPENCCA_GPU_OPP_BEGIN : i == 1U ? OPENCCA_GPU_OPP_END : OPENCCA_GPU_POWER_OFF;
+		unsigned long argument = 300000000UL;
+		struct smc_result result = task_pm(operation, argument, 0UL);
+
+		chain_expect(result.x[0] == RMI_ERROR_INPUT && writes == written &&
+			chain_cleans == cleaned && chain_invalidates == invalidated &&
+				opencca_gpu_service_isolated(&chain_owners[2],
+					xshm_endpoint_id(&chain_owners[2])) &&
+			!task_cpu_returns[0] && !task_cpu_returns[1],
+			"running-task clock or power reconfiguration is rejected without completion");
+	}
+	chain_expect(!opencca_gpu_mapping_allowed(&chain_owners[2], 0x80fb000000UL,
+		0xfb000000UL, 0x200000UL, 0x8000000000UL),
+		"mediated control cannot reinstall an S2 MMIO alias while tasks run");
 	if (task_fault_case == 3U) {
 		/* Neither a Host request nor a failed physical reset constitutes a
 		 * DMA-stop proof. Keep all task/backing leases and hidden controls. */
@@ -416,14 +649,18 @@ static void task_revocation(const char *firmware)
 		result = task_pm(OPENCCA_GPU_RESET, 0, 0);
 		chain_expect(result.x[0] == RMI_SUCCESS && opencca_gpu_state() == OPENCCA_GPU_QUARANTINED,
 			"successful quarantine RESET does not reopen service");
+		task_reset_completion_is_not_job_completion();
 		chain_denied(chain_call(0, GPU_PRIVATE_CONTEXT_DESTROY, task_contexts[0], 0, 0, 0, 0, 0));
 		result = task_pm(OPENCCA_GPU_RELEASE, 0, 0);
 		chain_expect(result.x[0] == RMI_SUCCESS && opencca_gpu_state() == OPENCCA_GPU_REVOKED,
 			"trusted RELEASE completes quarantine recovery");
 	} else {
 		struct smc_result result = task_pm(OPENCCA_GPU_RESET, 0, 0);
-		chain_expect(result.x[0] == RMI_SUCCESS && opencca_gpu_service_isolated(&chain_owners[2]),
+		chain_expect(result.x[0] == RMI_SUCCESS &&
+			opencca_gpu_service_isolated(&chain_owners[2],
+				xshm_endpoint_id(&chain_owners[2])),
 			"trusted mediated reset preserves only isolated service authority");
+		task_reset_completion_is_not_job_completion();
 	}
 	for (unsigned int c = 0; c < 2; c++) {
 		/* Unlike TASK_VALIDATE, metadata inspection does not consult a
@@ -480,7 +717,12 @@ int main(int argc, char **argv)
 	chain_setup(); chain_registration(); chain_busy_and_channels(); chain_handoff(); chain_control();
 	task_upload(argv[1]);
 	for (unsigned int c = 0; c < 2; c++) task_create(c);
-	for (unsigned int c = 0; c < 2; c++) { task_launch(c); task_bad_requests(c); }
+	for (unsigned int c = 0; c < 2; c++) {
+		task_launch(c);
+		task_bad_requests(c);
+		task_compromised_proxy_equivalent_controls(c);
+		task_completion_semantics(c);
+	}
 #ifdef GPU_RSI_REALM_LIFECYCLE_TEST
 	task_realm_lifecycle();
 	goto done;
@@ -493,12 +735,24 @@ int main(int argc, char **argv)
 		task_revocation(argv[1]);
 		goto done;
 	}
-	if (task_fault_case) task_finish_fault(); else task_finish_one(0);
+	if (task_fault_case) {
+		task_finish_fault();
+		task_colluded_cross_owner_hint();
+	} else {
+		task_finish_one(0);
+	}
 	task_finish_one(1);
 	chain_expect(task_pm(OPENCCA_GPU_RESET, 0, 0).x[0] == RMI_SUCCESS, "trusted RMI reset model");
 	if (task_fault_case) {
-		chain_success(chain_call(0, GPU_PRIVATE_CONTEXT_DESTROY, task_contexts[0], 0, 0, 0, 0, 0));
-		chain_success(chain_call(0, GPU_PRIVATE_BO_DESTROY, task_bos[0], 0, 0, 0, 0, 0));
+		if (task_fault_case == 1U) {
+			task_recover_after_fault(argv[1]);
+			chain_expect(task_pm(OPENCCA_GPU_RESET, 0, 0).x[0] == RMI_SUCCESS,
+				"replacement task lifetime retired by reset");
+		}
+		else {
+			chain_success(chain_call(0, GPU_PRIVATE_CONTEXT_DESTROY, task_contexts[0], 0, 0, 0, 0, 0));
+			chain_success(chain_call(0, GPU_PRIVATE_BO_DESTROY, task_bos[0], 0, 0, 0, 0, 0));
+		}
 	}
 	task_destroy_arena();
 done:
@@ -507,5 +761,6 @@ done:
 		!gpu_private_owner_busy(&chain_owners[2]), "all actual private owner refs retired");
 	printf("GPU_RSI_TASK_CHAIN=PASS case=%u rsi_requests=%u rmi_requests=%u reset_rsi_requests=%u reclaim_requests=%u clients=2 actual_memory_callbacks firmware/PT/dispatch/finish/return/retire/revoke/dead-owner MODEL_ONLY no shader/GPC/concurrency\n",
 		task_fault_case, chain_checks, task_rmi_requests, task_reset_rsi_requests, task_reclaim_requests);
+	puts("GPU_EQUIVALENT_CONTROL=PASS cases=2 actual_proxy_metadata_dispatch_completion_service_native_reset_mmio MODEL_ONLY no_external_dma");
 	return 0;
 }

@@ -17,5 +17,8 @@ bool opencca_check_pending_timers(struct rec *rec);
 void plat_opencca_timers_save(void);
 void plat_opencca_timers_mask(bool virtual_masked, bool physical_masked);
 void plat_opencca_timers_restore(void);
+void plat_opencca_host_timer_start(unsigned long control, unsigned long cval);
+bool plat_opencca_host_timer_expired(void);
+void plat_opencca_host_timer_stop(void);
 
 #endif /* TIMERS_H */

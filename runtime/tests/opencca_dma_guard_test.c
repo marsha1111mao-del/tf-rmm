@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #define PAGE 4096UL
+#define OWNER_ENDPOINT 1UL
 static const unsigned char owner;
 
 int main(void)
@@ -13,7 +14,7 @@ int main(void)
 
 	assert(opencca_gpu_control(NULL, NULL, OPENCCA_GPU_POWER_ON, 0UL, 0UL));
 	assert(opencca_gpu_mmio_grant(&owner));
-	assert(opencca_gpu_claim(&owner));
+	assert(opencca_gpu_claim(&owner, OWNER_ENDPOINT));
 	/* Neither an already active GPU page nor a larger covering DMA mapping
 	 * may be admitted. Failed admission must not leave a reservation.
 	 */

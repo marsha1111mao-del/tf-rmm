@@ -238,7 +238,7 @@ static const struct sysreg_handler sysreg_handlers[] = {
 	SYSREG_HANDLER(ESR_EL2_SYSREG_MASK, ESR_EL2_SYSREG_ICC_PMR_EL1,
 		       handle_icc_el1_sysreg_trap),
 
-#ifdef ENABLE_OPENCCA
+#if ENABLE_OPENCCA
 	/* Opencca TVM FWB trap mask */
 	SYSREG_HANDLER(ESR_EL2_SYSREG_HCR_TVM_MASK, ESR_EL2_SYSREG_SCTLR_EL1,
 						opencca_handle_esr_tvm_sysreg_trap),

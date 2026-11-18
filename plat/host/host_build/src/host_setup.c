@@ -9,14 +9,13 @@
 #include <host_defs.h>
 #include <host_rmi_wrappers.h>
 #include <host_utils.h>
+#include <opencca_gpu.h>
 #include <platform_api.h>
 #include <rmm_el3_ifc.h>
 #include <s2tt.h>
 #include <smc-rmi.h>
 #include <smc-rsi.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* Create a simple 4 level (Lvl 0 - LvL 3) RTT structure */
 #define RTT_COUNT 4
@@ -25,7 +24,18 @@
 	RMM_EL3_IFC_MAKE_VERSION(RMM_EL3_IFC_VERS_MAJOR, RMM_EL3_IFC_VERS_MINOR)
 #define RMM_EL3_MAX_CPUS		(1U)
 #define REALM_BUFFER_IPA		0x1000
-#define ATTEST_TOKEN_BUFFER_SIZE	0x100
+#define ATTEST_TOKEN_BUFFER_SIZE	0x1000
+
+static const unsigned char attestation_challenge[64] = {
+	0x47, 0x50, 0x55, 0x2d, 0x66, 0x61, 0x6b, 0x65,
+	0x2d, 0x68, 0x6f, 0x73, 0x74, 0x2d, 0x66, 0x75,
+	0x6c, 0x6c, 0x2d, 0x72, 0x6d, 0x6d, 0x2d, 0x74,
+	0x6f, 0x6b, 0x65, 0x6e, 0x2d, 0x76, 0x31, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
 
 #define CHECK_RMI_RESULT() \
 ({  \
@@ -36,19 +46,17 @@
 	}								\
 })
 
-static void print_buf(const unsigned char *buf, size_t size)
+static void print_hex_line(const char *label, const unsigned char *buf,
+			   size_t size)
 {
 	size_t i;
 
 	assert(buf != NULL);
+	INFO("%s", label);
 
-	for (i = 0; i < size; ++i) {
-		if ((i & 0xF) == 0) {
-			VERBOSE("\n");
-		}
-		VERBOSE(" %02x", buf[i]);
-	}
-	VERBOSE("\n\n");
+	for (i = 0; i < size; ++i)
+		INFO("%02x", buf[i]);
+	INFO("\n");
 }
 
 /*
@@ -75,12 +83,16 @@ static void *allocate_granule(void)
 	return (void *)granule;
 }
 
-static int realm_continue(unsigned long *regs);
-static int realm_continue_1(unsigned long *regs);
-static int realm_continue_2(unsigned long *regs);
+static int realm_register(unsigned long *regs);
+static int realm_claim(unsigned long *regs);
+static int realm_token_init(unsigned long *regs);
+static int realm_token_continue(unsigned long *regs);
+static int realm_token_continue_finalize(unsigned long *regs);
+static int realm_unregister_complete(unsigned long *regs);
 
 uintptr_t realm_buffer;
 static size_t token_size;
+static unsigned long endpoint_id;
 
 static int realm_start(unsigned long *regs)
 {
@@ -90,10 +102,10 @@ static int realm_start(unsigned long *regs)
 
 	regs[0] = SMC_RSI_VERSION;
 	regs[1] = RSI_ABI_VERSION;
-	return host_util_rsi_helper(realm_continue);
+	return host_util_rsi_helper(realm_register);
 }
 
-static int realm_continue(unsigned long *regs)
+static int realm_register(unsigned long *regs)
 {
 	INFO("RSI Version is 0x%lx : 0x%lx\n", regs[1], regs[2]);
 
@@ -102,23 +114,54 @@ static int realm_continue(unsigned long *regs)
 		return 0;
 	}
 
-	srand((int)time(NULL));
-
-	/* Add dummy Realm Attestation RSI calls */
-	regs[0] = SMC_RSI_ATTEST_TOKEN_INIT;
-	regs[1] = rand();
-	regs[2] = rand();
-	regs[3] = rand();
-	regs[4] = rand();
-	regs[5] = rand();
-	regs[6] = rand();
-	regs[7] = rand();
-	regs[8] = rand();
-
-	return host_util_rsi_helper(realm_continue_1);
+	regs[0] = SMC_RSI_OPENCCA_XSHM;
+	regs[1] = 0; /* XSHM_REGISTER */
+	regs[2] = 0;
+	regs[3] = 0;
+	regs[4] = 0;
+	regs[5] = 0;
+	regs[6] = 0;
+	regs[7] = 0;
+	return host_util_rsi_helper(realm_claim);
 }
 
-static int realm_continue_1(unsigned long *regs)
+static int realm_claim(unsigned long *regs)
+{
+	if (regs[0] != RSI_SUCCESS || regs[2] == 0UL) {
+		ERROR("xshm endpoint registration failed 0x%lx\n", regs[0]);
+		return 0;
+	}
+
+	endpoint_id = regs[2];
+	INFO("xshm endpoint id is 0x%lx\n", endpoint_id);
+
+	regs[0] = SMC_RSI_OPENCCA_GPU_CONTROL;
+	regs[1] = 0; /* GPU role claim */
+	regs[2] = 0;
+	regs[3] = 0;
+	regs[4] = 0;
+	regs[5] = 0;
+	regs[6] = 0;
+	regs[7] = 0;
+	return host_util_rsi_helper(realm_token_init);
+}
+
+static int realm_token_init(unsigned long *regs)
+{
+	if (regs[0] != RSI_SUCCESS) {
+		ERROR("GPU role claim failed 0x%lx\n", regs[0]);
+		return 0;
+	}
+
+	/* The fixed challenge is copied byte-for-byte through rec->regs[1]. */
+	regs[0] = SMC_RSI_ATTEST_TOKEN_INIT;
+	(void)memcpy(&regs[1], attestation_challenge,
+		     sizeof(attestation_challenge));
+
+	return host_util_rsi_helper(realm_token_continue);
+}
+
+static int realm_token_continue(unsigned long *regs)
 {
 	if (regs[0] != RSI_SUCCESS) {
 		ERROR("Realm token initialization failed 0x%lx\n", regs[0]);
@@ -136,10 +179,21 @@ static int realm_continue_1(unsigned long *regs)
 	regs[1] = REALM_BUFFER_IPA;
 	regs[2] = 0;
 	regs[3] = ATTEST_TOKEN_BUFFER_SIZE;
-	return host_util_rsi_helper(realm_continue_2);
+	return host_util_rsi_helper(realm_token_continue_finalize);
 }
 
-static int realm_continue_2(unsigned long *regs)
+static int realm_unregister_complete(unsigned long *regs)
+{
+	if (regs[0] != RSI_SUCCESS) {
+		ERROR("xshm endpoint unregistration failed 0x%lx\n", regs[0]);
+		return 0;
+	}
+
+	/* Simulate return back to NS due to FIQ. */
+	return ARM_EXCEPTION_FIQ_LEL;
+}
+
+static int realm_token_continue_finalize(unsigned long *regs)
 {
 	static unsigned long offset;
 
@@ -153,7 +207,7 @@ static int realm_continue_2(unsigned long *regs)
 		regs[1] = REALM_BUFFER_IPA;
 		regs[2] = offset;
 		regs[3] = ATTEST_TOKEN_BUFFER_SIZE;
-		return host_util_rsi_helper(realm_continue_2);
+		return host_util_rsi_helper(realm_token_continue_finalize);
 	}
 
 	if (regs[0] != RSI_SUCCESS) {
@@ -163,8 +217,15 @@ static int realm_continue_2(unsigned long *regs)
 
 	token_size = offset + regs[1];
 
-	/* Simulate return back to NS due to FIQ */
-	return ARM_EXCEPTION_FIQ_LEL;
+	regs[0] = SMC_RSI_OPENCCA_XSHM;
+	regs[1] = 8; /* XSHM_UNREGISTER */
+	regs[2] = 0;
+	regs[3] = 0;
+	regs[4] = 0;
+	regs[5] = 0;
+	regs[6] = 0;
+	regs[7] = 0;
+	return host_util_rsi_helper(realm_unregister_complete);
 }
 
 static int create_realm(void)
@@ -244,6 +305,10 @@ static int create_realm(void)
 	CHECK_RMI_RESULT();
 	host_rmi_realm_activate(rd, &result);
 	CHECK_RMI_RESULT();
+	host_rmi_opencca_gpu_pm(OPENCCA_GPU_POWER_ON, 0, 0, &result);
+	CHECK_RMI_RESULT();
+	host_rmi_opencca_gpu_mmio_grant(rd, &result);
+	CHECK_RMI_RESULT();
 
 	/* Execute the Realm */
 	memset(rec_run, 0, sizeof(*rec_run));
@@ -261,9 +326,14 @@ static int create_realm(void)
 		INFO("Realm executed successfully and exited due to FIQ.\n");
 	}
 
-	VERBOSE("Print attestation token (size: %ld):\n", token_size);
-	print_buf((void *)realm_buffer, token_size);
-
+	INFO("RMM_GPU_ENDPOINT_ID %lu\n", endpoint_id);
+	print_hex_line("RMM_GPU_CHALLENGE_HEX ",
+		       attestation_challenge, sizeof(attestation_challenge));
+	INFO("RMM_GPU_TOKEN_SIZE %zu\n", token_size);
+	print_hex_line("RMM_GPU_TOKEN_HEX ",
+		       (void *)realm_buffer, token_size);
+	host_rmi_opencca_gpu_pm(OPENCCA_GPU_RELEASE, 0, 0, &result);
+	CHECK_RMI_RESULT();
 	host_rmi_rec_destroy(rec, &result);
 	CHECK_RMI_RESULT();
 

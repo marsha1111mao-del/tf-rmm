@@ -19,6 +19,7 @@
 #define REALM_SYSTEM_OFF 2U
 #define SLOT_RD 0U
 #define GRANULE_STATE_RD 1U
+#define SERVICE_ENDPOINT 1UL
 struct rd { unsigned int state; };
 struct granule { unsigned int state, refs; bool locked; struct rd rd; };
 struct smc_result { unsigned long x[8]; };
@@ -248,7 +249,8 @@ int main(void)
 	assert(gpu_private_range_busy(&realms[1], IPA, PAGE));
 	smc_opencca_gpu_pm(OPENCCA_GPU_POWER_ON, 0UL, 0UL, &s);
 	assert(s.x[0] == RMI_SUCCESS);
-	assert(opencca_gpu_mmio_grant(&realms[0]) && opencca_gpu_claim(&realms[0]));
+	assert(opencca_gpu_mmio_grant(&realms[0]) &&
+	       opencca_gpu_claim(&realms[0], SERVICE_ENDPOINT));
 	expect(reclaim(1U), RMI_ERROR_INPUT, GPU_PRIVATE_STATE);
 	reset_ok = false;
 	smc_opencca_gpu_pm(OPENCCA_GPU_RELEASE, 0UL, 0UL, &s);
@@ -324,7 +326,7 @@ int main(void)
 	smc_opencca_gpu_pm(OPENCCA_GPU_POWER_ON, 0UL, 0UL, &s);
 	assert(s.x[0] == RMI_SUCCESS);
 	assert(smc_opencca_gpu_mmio_grant((unsigned long)&realms[0]) == RMI_SUCCESS);
-	assert(opencca_gpu_claim(&realms[0])); cases++;
+	assert(opencca_gpu_claim(&realms[0], SERVICE_ENDPOINT)); cases++;
 	bo1 = object(1U, PAGES); append(1U, bo1, PAGES, false);
 	ctx1 = context(1U); (void)ctx1;
 	bo2 = object(2U, 1U); append(2U, bo2, 1U, false);

@@ -8,6 +8,7 @@
 #include <debug.h>
 #include <granule.h>
 #include <measurement.h>
+#include <opencca_gpu_role.h>
 #include <realm.h>
 #include <rsi-handler.h>
 #include <smc-rsi.h>
@@ -408,6 +409,7 @@ void handle_rsi_measurement_extend(struct rec *rec, struct rsi_result *res)
 	index = rec->regs[1];
 
 	if ((index == RIM_MEASUREMENT_SLOT) ||
+	    (index == OPENCCA_GPU_ROLE_MEASUREMENT_SLOT) ||
 	    (index >= MEASUREMENT_SLOT_NR)) {
 		res->smc_res.x[0] = RSI_ERROR_INPUT;
 		goto out_unmap_rd;

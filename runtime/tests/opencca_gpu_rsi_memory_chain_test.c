@@ -23,6 +23,8 @@
 #else
 #define CHAIN_PA 0x60000000UL
 #endif
+#define CHAIN_PTE_RO (1UL << 7U)
+#define CHAIN_PTE_XN (3UL << 53U)
 #define SLOT_RSI_CALL 3U
 #define MAX_CPUS 1U
 #define UPDATE_REC_RETURN_TO_REALM 1U
@@ -231,11 +233,28 @@ static void spinlock_release(int *lock)
 #include "chain-translate.inc"
 #include "chain-copy.inc"
 #include "chain-memory.inc"
+
+static bool read_command_page(unsigned long pa, size_t offset, void *destination, size_t bytes)
+{
+	struct granule *data;
+	unsigned long index;
+
+	if (destination == NULL || bytes == 0U || offset > 4096U || bytes > 4096U - offset)
+		return false;
+	data = find_lock_granule(pa, GRANULE_STATE_DATA);
+	if (data == NULL)
+		return false;
+	index = (data->pa - CHAIN_PA) / 4096UL;
+	memcpy(destination, chain_device[index / CHAIN_PAGES][index % CHAIN_PAGES] + offset, bytes);
+	granule_unlock(data);
+	return true;
+}
+
 /* Actual memory/RTT callbacks; PT physical addressing/cleaning are host models.
  * The task-chain fixture additionally exercises modeled launch/completion. */
 static const struct gpu_private_ops operations = {
 	.source_page = source_page, .clear_page = clear_page,
-	.write_page = write_page, .read_page = read_page,
+	.write_page = write_page, .read_page = read_page, .read_command_page = read_command_page,
 	.sync_page_for_device = sync_page_for_device, .sync_page_for_cpu = sync_page_for_cpu,
 	.cache_barrier = cache_barrier, .hide_page = gpu_control_rtt_hide,
 	.restore_page = gpu_control_rtt_restore, .restore_page_uncached = gpu_private_rtt_restore_uncached,
@@ -248,7 +267,10 @@ static const struct gpu_private_ops operations = {
 };
 static const struct opencca_gpu_ops chain_device_ops;
 bool opencca_gpu_isolate_service(const void *owner)
-{ return opencca_gpu_service_isolate(&chain_device_ops, owner); }
+{
+	return opencca_gpu_service_isolate(&chain_device_ops, owner,
+					   xshm_endpoint_id(owner));
+}
 static bool chain_revoke_mmio(const void *owner)
 { assert(owner == &chain_owners[2] && !opencca_gpu_mmio_allowed(owner)); return true; }
 static const struct opencca_gpu_ops chain_device_ops = {
@@ -352,7 +374,6 @@ static void chain_setup(void)
 {
 	initialize();
 	assert(opencca_gpu_control(&chain_device_ops, NULL, OPENCCA_GPU_POWER_ON, 0, 0));
-	assert(opencca_gpu_mmio_grant(&chain_owners[2]) && opencca_gpu_claim(&chain_owners[2]));
 	unsigned long out[4];
 	for (unsigned int c = 0; c < OWNERS; c++) {
 		chain_owners[c] = (struct granule){.state = GRANULE_STATE_RD};
@@ -371,6 +392,8 @@ static void chain_setup(void)
 		memset(chain_device[c], 0x30 + c, sizeof(chain_device[c]));
 		assert(xshm_endpoint_call(&chain_owners[c], XSHM_REGISTER, 0, 0, out) == XSHM_SUCCESS);
 	}
+	assert(opencca_gpu_mmio_grant(&chain_owners[2]) &&
+	       opencca_gpu_claim(&chain_owners[2], xshm_endpoint_id(&chain_owners[2])));
 	/* Legacy leases cannot be acquired after service isolation. Exercise the
 	 * actual physical lease guard before isolation as a supplementary direct
 	 * callback probe, not a private RSI request. */
@@ -397,17 +420,22 @@ static void chain_input(unsigned int c, unsigned long ipa, unsigned int count)
 	memcpy(chain_device[c][0], values, count * sizeof(values[0]));
 	memset(chain_cpu[c][0], 0xe1, 4096); /* stale CPU snapshot */
 }
-static unsigned long chain_leaf(unsigned long root, unsigned long va)
+static uint64_t *chain_leaf_entry(unsigned long root, unsigned long va)
 {
 	unsigned long address = root;
+	const uint64_t *table = NULL;
 	for (unsigned int level = 0; level < 4U; level++) {
 		chain_expect(address >= TABLE_BASE && address < TABLE_BASE + GPU_PRIVATE_TABLES * 4096UL, "PT walk remains in trusted table pool");
-		const uint64_t *table = (const void *)(table_base + address - TABLE_BASE);
+		table = (const void *)(table_base + address - TABLE_BASE);
 		uint64_t entry = table[(va >> (39U - level * 9U)) & 511UL];
 		chain_expect((entry & 3UL) == 3UL, "hardware-format PT entry valid");
 		address = entry & UINT64_C(0x000000fffffff000);
 	}
-	return address;
+	return (uint64_t *)table + ((va >> 12U) & 511UL);
+}
+static unsigned long chain_leaf(unsigned long root, unsigned long va)
+{
+	return *chain_leaf_entry(root, va) & UINT64_C(0x000000fffffff000);
 }
 static void chain_registration(void)
 {
@@ -449,6 +477,63 @@ static void chain_registration(void)
 		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, contexts[c], chain_channels[c], 0x800000UL, 2, 0, 0));
 		chain_success(chain_call(c, GPU_PRIVATE_CONTEXT_DESTROY, contexts[c], 0, 0, 0, 0, 0));
 		chain_success(chain_call(c, GPU_PRIVATE_BO_DESTROY, bos[c], 0, 0, 0, 0, 0));
+	}
+
+	unsigned char readonly_sentinel;
+	{
+		struct gpu_private_result r = chain_call(0, GPU_PRIVATE_BO_CREATE,
+			chain_channels[0], 4096, GPU_PRIVATE_READ, 0, 0, 0);
+		chain_success(r); unsigned long readonly_bo = r.value[0];
+		chain_input(0, DATA_IPA, 1);
+		chain_success(chain_call(0, GPU_PRIVATE_BO_APPEND, readonly_bo, INPUT_IPA, 1, 0, 0, 0));
+		r = chain_call(0, GPU_PRIVATE_CONTEXT_CREATE, chain_channels[0], 0, 0, 0, 0, 0);
+		chain_success(r); unsigned long readonly_context = r.value[0]; unsigned long root = latest_table_pa;
+		readonly_sentinel = chain_device[0][1][0];
+		r = chain_call(0, GPU_PRIVATE_MAP_AUTHORIZE, readonly_context, readonly_bo,
+			0, 0x800000UL, 1, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "read-only BO rejects writable grant");
+		r = chain_call(0, GPU_PRIVATE_MAP_AUTHORIZE, readonly_context, readonly_bo,
+			0, 0x800000UL, 1, GPU_PRIVATE_READ | GPU_PRIVATE_EXEC);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "non-executable BO rejects executable grant");
+		r = chain_call(0, GPU_PRIVATE_MAP_AUTHORIZE, readonly_context, readonly_bo,
+			0, 0x800000UL, 1, GPU_PRIVATE_READ);
+		chain_success(r); unsigned long readonly_grant = r.value[0];
+		r = chain_call(2, GPU_PRIVATE_SERVICE_MAP, readonly_context, chain_channels[0],
+			readonly_grant, 0, 0x800000UL, (1UL << 8U) | GPU_PRIVATE_READ | GPU_PRIVATE_WRITE);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "read-only grant rejects writable service map");
+		r = chain_call(2, GPU_PRIVATE_SERVICE_MAP, readonly_context, chain_channels[0],
+			readonly_grant, 0, 0x800000UL, (1UL << 8U) | GPU_PRIVATE_READ | GPU_PRIVATE_EXEC);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "non-executable grant rejects executable service map");
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_MAP, readonly_context, chain_channels[0],
+			readonly_grant, 0, 0x800000UL, (1UL << 8U) | GPU_PRIVATE_READ));
+		uint64_t pte = *chain_leaf_entry(root, 0x800000UL);
+		chain_expect((pte & CHAIN_PTE_RO) != 0U, "read-only BO PTE rejects writes");
+		chain_expect((pte & CHAIN_PTE_XN) == CHAIN_PTE_XN, "non-executable BO PTE rejects instruction fetch");
+		r = chain_call(0, GPU_PRIVATE_MAP_AUTHORIZE, readonly_context, readonly_bo,
+			0, 0x802000UL, 1, GPU_PRIVATE_READ | GPU_PRIVATE_WRITE);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "second GPUVA cannot request writable mapping");
+		r = chain_call(0, GPU_PRIVATE_MAP_AUTHORIZE, readonly_context, readonly_bo,
+			0, 0x802000UL, 1, GPU_PRIVATE_READ);
+		chain_success(r); unsigned long second_gpuva_grant = r.value[0];
+		r = chain_call(2, GPU_PRIVATE_SERVICE_MAP, readonly_context, chain_channels[0],
+			second_gpuva_grant, 0, 0x802000UL, (1UL << 8U) | GPU_PRIVATE_READ | GPU_PRIVATE_WRITE);
+		chain_expect(r.status != GPU_PRIVATE_SUCCESS, "second GPUVA service map cannot upgrade permissions");
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_MAP, readonly_context, chain_channels[0],
+			second_gpuva_grant, 0, 0x802000UL, (1UL << 8U) | GPU_PRIVATE_READ));
+		pte = *chain_leaf_entry(root, 0x802000UL);
+		chain_expect((pte & CHAIN_PTE_RO) != 0U, "second GPUVA read-only PTE rejects writes");
+		chain_expect((pte & CHAIN_PTE_XN) == CHAIN_PTE_XN, "second GPUVA non-executable PTE rejects instruction fetch");
+		chain_expect(chain_device[0][1][0] == readonly_sentinel, "permission denial cannot mutate victim backing");
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, readonly_context, chain_channels[0], 0x800000UL, 1, 0, 0));
+		chain_success(chain_call(2, GPU_PRIVATE_SERVICE_UNMAP, readonly_context, chain_channels[0], 0x802000UL, 1, 0, 0));
+		r = chain_call(2, GPU_PRIVATE_BO_INSPECT, chain_channels[0], readonly_bo, 0, 0, 0, 0);
+		chain_success(r);
+		chain_expect(r.value[3] == 0UL, "both read-only GPUVA leaves are unmapped");
+		r = chain_call(0, GPU_PRIVATE_QUERY, readonly_context, 0, 0, 0, 0, 0);
+		chain_success(r);
+		chain_expect(r.value[0] == 0UL, "read-only context has no mapped leaves");
+		chain_success(chain_call(0, GPU_PRIVATE_CONTEXT_DESTROY, readonly_context, 0, 0, 0, 0, 0));
+		chain_success(chain_call(0, GPU_PRIVATE_BO_DESTROY, readonly_bo, 0, 0, 0, 0, 0));
 	}
 }
 static void chain_busy_and_channels(void)

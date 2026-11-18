@@ -8,7 +8,8 @@ int main(void)
 	unsigned long lr[4] = {0};
 
 	assert(!xshm_irq_host_valid(NULL, 4));
-	assert(!xshm_irq_host_valid(lr, 1));
+	assert(xshm_irq_host_valid(lr, 1));
+	assert(!xshm_irq_host_valid(lr, 0));
 	assert(xshm_irq_host_valid(lr, 4));
 	lr[0] = (1UL << 62U) | 32UL;
 	assert(xshm_irq_host_valid(lr, 4));

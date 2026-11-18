@@ -49,7 +49,8 @@ int main(int argc, char **argv)
     assert(argc == 2);
     unsigned int scenario = (unsigned int)strtoul(argv[1], NULL, 10);
     assert(scenario < 26U);
-    assert(sizeof(struct private_context) == 112U && sizeof(struct private_bo) == 600U);
+    /* Page-number bounds free eight bytes per BO for the bounded map state. */
+    assert(sizeof(struct private_context) == 112U && sizeof(struct private_bo) == 592U);
     struct gpu_private_result r;
     unsigned long ctx = make_context(&client);
     struct private_context *c = ctx_lookup(&client, ctx);

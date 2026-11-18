@@ -176,6 +176,289 @@ static void test_fast_irq(void)
 	puts("XSHM_FAST_IRQ_POLICY_TEST=PASS");
 }
 
+#define TRUSTED_HISTORY_CAPACITY 4U
+
+struct trusted_history {
+	unsigned long sequence[TRUSTED_HISTORY_CAPACITY];
+	unsigned long produced;
+	unsigned long consumed;
+	bool consumer_active;
+	bool lost;
+};
+
+static bool history_capture(struct trusted_history *history,
+			    unsigned long sequence)
+{
+	if (history->consumer_active || history->lost ||
+	    sequence == 0UL || sequence != history->produced + 1UL ||
+	    history->produced - history->consumed == TRUSTED_HISTORY_CAPACITY) {
+		history->lost = true;
+		return false;
+	}
+	history->sequence[history->produced % TRUSTED_HISTORY_CAPACITY] = sequence;
+	history->produced++;
+	return true;
+}
+
+static bool history_consume(struct trusted_history *history,
+			    unsigned long sequence)
+{
+	bool consumed = false;
+
+	if (history->consumer_active || history->lost || sequence == 0UL ||
+	    sequence != history->consumed + 1UL || sequence > history->produced) {
+		history->lost = true;
+		return false;
+	}
+	history->consumer_active = true;
+	if (history->sequence[(sequence - 1UL) % TRUSTED_HISTORY_CAPACITY] ==
+	    sequence) {
+		history->consumed = sequence;
+		consumed = true;
+	} else {
+		history->lost = true;
+	}
+	history->consumer_active = false;
+	return consumed;
+}
+
+static bool history_can_finish(const struct trusted_history *history)
+{
+	return !history->lost && history->consumed == history->produced;
+}
+
+static unsigned long new_irq_channel(void)
+{
+	unsigned long channel;
+	unsigned long peer;
+
+	assert(call(0U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_REGISTER, 0UL, 0UL) == XSHM_SUCCESS);
+	peer = output[1];
+	assert(call(0U, XSHM_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_IRQ_BIND, 0UL, 0UL) == XSHM_SUCCESS);
+	assert(call(0U, XSHM_OFFER, peer, 0UL) == XSHM_SUCCESS);
+	channel = output[0];
+	assert(call(1U, XSHM_ACCEPT, channel, 0UL) == XSHM_SUCCESS);
+	assert(call(1U, XSHM_ACK_ARM, channel, 0UL) == XSHM_SUCCESS);
+	return channel;
+}
+
+static void release_irq_channel(void)
+{
+	xshm_endpoint_release(&owners[0]);
+	xshm_endpoint_release(&owners[1]);
+}
+
+static void test_irq_history(void)
+{
+	struct trusted_history history = {0};
+	unsigned long channel = new_irq_channel();
+	unsigned int cases = 0U;
+
+	for (unsigned long sequence = 1UL;
+	     sequence <= TRUSTED_HISTORY_CAPACITY + 2UL; sequence++) {
+		assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+		assert(output[0] == sequence);
+		if (sequence <= TRUSTED_HISTORY_CAPACITY)
+			assert(history_capture(&history, output[0]));
+		else
+			assert(!history_capture(&history, output[0]) &&
+			       history.lost);
+		if (sequence == 1UL) {
+			assert(xshm_endpoint_irq_take(&owners[1]));
+		} else {
+			assert(!xshm_endpoint_irq_take(&owners[1]));
+		}
+	}
+	assert(!history_can_finish(&history));
+	cases++;
+	release_irq_channel();
+
+	history = (struct trusted_history){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	assert(history_consume(&history, output[0]));
+	assert(history_can_finish(&history));
+	cases++;
+	release_irq_channel();
+
+	history = (struct trusted_history){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	assert(!history_consume(&history, 2UL) && history.lost);
+	assert(!history_can_finish(&history));
+	cases++;
+	release_irq_channel();
+
+	history = (struct trusted_history){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	assert(history_consume(&history, 1UL));
+	assert(!history_consume(&history, 1UL) && history.lost);
+	assert(!history_can_finish(&history));
+	cases++;
+	release_irq_channel();
+
+	history = (struct trusted_history){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(history_capture(&history, output[0]));
+	history.consumer_active = true;
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(!history_capture(&history, output[0]) && history.lost);
+	assert(!history_consume(&history, 1UL));
+	history.consumer_active = false;
+	assert(!history_can_finish(&history));
+	cases++;
+	release_irq_channel();
+
+	printf("XSHM_IRQ_HISTORY_POLICY_TEST=PASS cases=%u\n", cases);
+}
+
+#define TRUSTED_IRQ_LOG_CAPACITY 4U
+
+struct trusted_irq_record {
+	unsigned long sequence;
+	unsigned long cpu;
+	const void *owner;
+};
+
+struct trusted_irq_log {
+	struct trusted_irq_record record[TRUSTED_IRQ_LOG_CAPACITY];
+	unsigned long produced;
+	unsigned long consumed;
+	bool lost;
+};
+
+static bool irq_log_capture(struct trusted_irq_log *log,
+			    const void *owner, unsigned long sequence,
+			    unsigned long cpu)
+{
+	if (log->lost || owner == NULL || cpu == 0UL || sequence == 0UL ||
+	    sequence != log->produced + 1UL ||
+	    log->produced - log->consumed == TRUSTED_IRQ_LOG_CAPACITY) {
+		log->lost = true;
+		return false;
+	}
+	log->record[log->produced % TRUSTED_IRQ_LOG_CAPACITY] =
+		(struct trusted_irq_record){sequence, cpu, owner};
+	log->produced++;
+	return true;
+}
+
+static bool irq_log_consume(struct trusted_irq_log *log,
+			    const void *owner, unsigned long sequence,
+			    unsigned long cpu)
+{
+	const struct trusted_irq_record *record;
+
+	if (log->lost || owner == NULL || cpu == 0UL || sequence == 0UL ||
+	    sequence != log->consumed + 1UL || sequence > log->produced) {
+		log->lost = true;
+		return false;
+	}
+	record = &log->record[(sequence - 1UL) % TRUSTED_IRQ_LOG_CAPACITY];
+	if (record->sequence != sequence || record->owner != owner ||
+	    record->cpu != cpu) {
+		log->lost = true;
+		return false;
+	}
+	log->consumed = sequence;
+	return true;
+}
+
+static bool irq_log_can_finish(const struct trusted_irq_log *log)
+{
+	return !log->lost && log->consumed == log->produced;
+}
+
+static void test_irq_log_integrity(void)
+{
+	struct trusted_irq_log log = {0};
+	unsigned long channel = new_irq_channel();
+	unsigned int cases = 0U;
+
+	for (unsigned long sequence = 1UL;
+	     sequence <= TRUSTED_IRQ_LOG_CAPACITY + 2UL; sequence++) {
+		assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+		assert(output[0] == sequence);
+		assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+		assert(irq_log_consume(&log, &owners[1], output[0], 1UL));
+	}
+	assert(irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	log = (struct trusted_irq_log){0};
+	channel = new_irq_channel();
+	for (unsigned long sequence = 1UL;
+	     sequence <= TRUSTED_IRQ_LOG_CAPACITY + 1UL; sequence++) {
+		assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+		assert(output[0] == sequence);
+		if (sequence <= TRUSTED_IRQ_LOG_CAPACITY)
+			assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+		else
+			assert(!irq_log_capture(&log, &owners[1], output[0], 1UL) &&
+			       log.lost);
+	}
+	assert(!irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	log = (struct trusted_irq_log){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(output[0] == 2UL);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(!irq_log_consume(&log, &owners[1], 2UL, 1UL) && log.lost);
+	assert(!irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	log = (struct trusted_irq_log){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(output[0] == 2UL);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(irq_log_consume(&log, &owners[1], 1UL, 1UL));
+	assert(!irq_log_consume(&log, &owners[1], 1UL, 1UL) && log.lost);
+	assert(!irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	log = (struct trusted_irq_log){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(!irq_log_consume(&log, &owners[0], output[0], 1UL) && log.lost);
+	assert(!irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	log = (struct trusted_irq_log){0};
+	channel = new_irq_channel();
+	assert(call(0U, XSHM_NOTIFY, channel, 0UL) == XSHM_SUCCESS);
+	assert(irq_log_capture(&log, &owners[1], output[0], 1UL));
+	assert(!irq_log_consume(&log, &owners[1], output[0], 2UL) && log.lost);
+	assert(!irq_log_can_finish(&log));
+	cases++;
+	release_irq_channel();
+
+	printf("XSHM_IRQ_LOG_INTEGRITY_POLICY_TEST=PASS cases=%u\n", cases);
+}
+
 int main(void)
 {
 	unsigned long a, b, c, channel, replacement, seen;
@@ -295,6 +578,8 @@ int main(void)
 	assert(xshm_endpoint_call(NULL, XSHM_REGISTER, 0UL, 0UL, output) == XSHM_ERROR_INPUT);
 	test_resident_request_wake();
 	test_fast_irq();
+	test_irq_history();
+	test_irq_log_integrity();
 	puts("XSHM_ENDPOINT_POLICY_TEST=PASS");
 	return 0;
 }
